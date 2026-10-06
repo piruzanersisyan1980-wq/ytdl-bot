@@ -1,0 +1,13 @@
+services:
+  - type: web
+    name: ytdl-bot
+    runtime: docker
+    plan: free
+    healthCheckPath: /
+    envVars:
+      - key: BOT_TOKEN
+        sync: false
+      - key: MAX_CONCURRENT
+        value: "3"
+      - key: MAX_SIZE_MB
+        value: "50"
