@@ -5,6 +5,7 @@ import time
 import asyncio
 import logging
 import tempfile
+import shutil
 from pathlib import Path
 from threading import Thread
 from http.server import BaseHTTPRequestHandler, HTTPServer
@@ -28,24 +29,34 @@ MAX_TITLE_LEN  = int(os.getenv("MAX_TITLE_LEN", "60"))
 DOWNLOAD_DIR   = Path(tempfile.gettempdir()) / "ytdl_bot"
 DOWNLOAD_DIR.mkdir(exist_ok=True)
 
-# Cookies ищем в трёх местах: рядом с ботом, в Render Secret Files, в /app
-COOKIES_FILE = Path(__file__).parent / "cookies.txt"
-if not COOKIES_FILE.exists() and Path("/etc/secrets/cookies.txt").exists():
-    COOKIES_FILE = Path("/etc/secrets/cookies.txt")
-
 logging.basicConfig(
     format="%(asctime)s %(levelname)s %(name)s: %(message)s",
     level=logging.INFO,
 )
 log = logging.getLogger("ytdl-bot")
+
+# ===== COOKIES =====
+# Ищем cookies.txt в трёх местах, при необходимости копируем из read-only
+# /etc/secrets/ (Render Secret Files) в записываемый /tmp/
+COOKIES_FILE = Path(__file__).parent / "cookies.txt"
+SECRET_COOKIES = Path("/etc/secrets/cookies.txt")
+if not COOKIES_FILE.exists() and SECRET_COOKIES.exists():
+    try:
+        _tmp = Path(tempfile.gettempdir()) / "cookies.txt"
+        shutil.copyfile(SECRET_COOKIES, _tmp)
+        COOKIES_FILE = _tmp
+    except Exception as _e:
+        log.error("Не скопировать cookies: %s", _e)
+        COOKIES_FILE = SECRET_COOKIES
+
 log.info("COOKIES_FILE = %s (exists=%s)", COOKIES_FILE, COOKIES_FILE.exists())
+# ====================
 
 URL_RE = re.compile(
     r"https?://(?:www\.|m\.)?"
     r"(?:youtube\.com/(?:watch\?v=|shorts/|live/)|youtu\.be/)"
     r"[\w\-]{6,}"
 )
-# =====================
 
 # ===== СЧЁТЧИКИ ЗАДАЧ =====
 _semaphore  = asyncio.Semaphore(MAX_CONCURRENT)
