@@ -27,13 +27,18 @@ MAX_CONCURRENT = int(os.getenv("MAX_CONCURRENT", "3"))
 MAX_TITLE_LEN  = int(os.getenv("MAX_TITLE_LEN", "60"))
 DOWNLOAD_DIR   = Path(tempfile.gettempdir()) / "ytdl_bot"
 DOWNLOAD_DIR.mkdir(exist_ok=True)
-COOKIES_FILE   = Path(__file__).parent / "cookies.txt"
+
+# Cookies ищем в трёх местах: рядом с ботом, в Render Secret Files, в /app
+COOKIES_FILE = Path(__file__).parent / "cookies.txt"
+if not COOKIES_FILE.exists() and Path("/etc/secrets/cookies.txt").exists():
+    COOKIES_FILE = Path("/etc/secrets/cookies.txt")
 
 logging.basicConfig(
     format="%(asctime)s %(levelname)s %(name)s: %(message)s",
     level=logging.INFO,
 )
 log = logging.getLogger("ytdl-bot")
+log.info("COOKIES_FILE = %s (exists=%s)", COOKIES_FILE, COOKIES_FILE.exists())
 
 URL_RE = re.compile(
     r"https?://(?:www\.|m\.)?"
@@ -219,7 +224,7 @@ async def _release_slot():
 
 # ===== команды =====
 async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    cookies_note = "🍪 Cookies: загружены" if COOKIES_FILE.exists() else "⚠️ Cookies: НЕТ (нужны для YouTube)"
+    cookies_note = "🍪 Cookies: загружены" if COOKIES_FILE.exists() else "⚠️ Cookies: НЕТ"
     await update.message.reply_text(
         "👋 Привет! Я качаю видео с YouTube.\n\n"
         "Просто **пришлите ссылку** — я покажу превью и кнопки качества.\n\n"
