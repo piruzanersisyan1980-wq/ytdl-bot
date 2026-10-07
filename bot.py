@@ -36,8 +36,6 @@ logging.basicConfig(
 log = logging.getLogger("ytdl-bot")
 
 # ===== COOKIES =====
-# Ищем cookies.txt в трёх местах, при необходимости копируем из read-only
-# /etc/secrets/ (Render Secret Files) в записываемый /tmp/
 COOKIES_FILE = Path(__file__).parent / "cookies.txt"
 SECRET_COOKIES = Path("/etc/secrets/cookies.txt")
 if not COOKIES_FILE.exists() and SECRET_COOKIES.exists():
@@ -266,7 +264,6 @@ async def cmd_help(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 async def cmd_cancel(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     ctx.user_data.pop("url", None)
-    ctx.user_data.pop("mode", None)
     await update.message.reply_text("Отменено.", reply_markup=REPLY_MENU)
 
 
@@ -307,17 +304,21 @@ async def _quick(update: Update, ctx: ContextTypes.DEFAULT_TYPE, kind: str):
     await _do_download(update, ctx, m.group(0), kind)
 
 
-# ===== кнопки меню =====
+# ===== кнопки меню (теперь БЕЗ быстрого пути) =====
 async def handle_menu_button(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     text = (update.message.text or "").strip()
 
     if text == "🎬 Скачать видео":
-        ctx.user_data["mode"] = "video"
-        await update.message.reply_text("🎬 Пришлите ссылку на видео.", reply_markup=REPLY_MENU)
+        await update.message.reply_text(
+            "🎬 Пришлите ссылку — покажу варианты качества.",
+            reply_markup=REPLY_MENU,
+        )
         return
     if text == "🎵 Скачать MP3":
-        ctx.user_data["mode"] = "audio"
-        await update.message.reply_text("🎵 Пришлите ссылку — верну MP3.", reply_markup=REPLY_MENU)
+        await update.message.reply_text(
+            "🎵 Пришлите ссылку — покажу варианты (в том числе MP3).",
+            reply_markup=REPLY_MENU,
+        )
         return
     if text == "ℹ️ Помощь":
         await cmd_help(update, ctx)
@@ -329,10 +330,11 @@ async def handle_menu_button(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await cmd_cancel(update, ctx)
         return
 
+    # Не кнопка — считаем ссылкой
     await handle_link(update, ctx)
 
 
-# ===== обработка ссылки + превью =====
+# ===== обработка ссылки + превью (всегда с меню качества) =====
 async def handle_link(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     text = update.message.text or ""
     m = URL_RE.search(text)
@@ -347,11 +349,6 @@ async def handle_link(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
     url = m.group(0)
     ctx.user_data["url"] = url
-
-    mode = ctx.user_data.pop("mode", None)
-    if mode == "audio":
-        await _do_download(update, ctx, url, "audio")
-        return
 
     placeholder = await update.message.reply_text("🔍 Получаю информацию…")
     await ctx.bot.send_chat_action(update.message.chat_id, ChatAction.TYPING)
@@ -397,7 +394,6 @@ async def on_quality(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
     if kind == "back":
         ctx.user_data.pop("url", None)
-        ctx.user_data.pop("mode", None)
         try:
             await query.edit_message_caption(caption="⬅️ Ок. Пришлите новую ссылку.", reply_markup=EMPTY_KB)
             return
@@ -409,7 +405,6 @@ async def on_quality(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
     if kind == "cancel":
         ctx.user_data.pop("url", None)
-        ctx.user_data.pop("mode", None)
         await _clear_keyboard(query)
         await _set_status(query, "❌ Отменено.")
         return
