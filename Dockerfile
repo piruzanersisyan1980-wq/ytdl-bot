@@ -16,13 +16,13 @@ WORKDIR /app
 COPY requirements.txt .
 RUN pip install -r requirements.txt
 
-# Ставим yt-dlp ГЛАВНУЮ версию с GitHub (всегда свежая, обгоняет PyPI)
+# yt-dlp из GitHub master — всегда самая свежая версия
 RUN pip install --upgrade --force-reinstall "git+https://github.com/yt-dlp/yt-dlp.git@master"
 
-# Проверка версии в логах
+# Показать версию в логах при сборке
 RUN yt-dlp --version
 
 COPY bot.py .
 
-# Авто-обновление yt-dlp при каждом запуске
+# Авто-обновление yt-dlp при каждом запуске контейнера
 CMD ["sh", "-c", "pip install -U --force-reinstall 'git+https://github.com/yt-dlp/yt-dlp.git@master' --quiet && exec python bot.py"]
