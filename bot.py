@@ -1,4 +1,4 @@
-# bot.py — YouTube + Instagram + Facebook + обязательная подписка
+# bot.py — YouTube + Instagram + Facebook + обязательная подписка на @edrike_channel
 import os
 import re
 import time
@@ -30,10 +30,10 @@ DOWNLOAD_DIR   = Path(tempfile.gettempdir()) / "ytdl_bot"
 DOWNLOAD_DIR.mkdir(exist_ok=True)
 
 # ===== ОБЯЗАТЕЛЬНАЯ ПОДПИСКА =====
-REQUIRED_CHANNELS = ["@my_channel_bot"]
+REQUIRED_CHANNELS = ["@edrike_channel"]
 
 CHANNEL_BUTTONS = {
-    "@my_channel_bot": "📢 Подписаться на канал",
+    "@edrike_channel": "📢 Подписаться на канал",
 }
 # =====================================
 
