@@ -1,4 +1,4 @@
-# bot.py
+# bot.py — YouTube + Instagram + Facebook
 import os
 import re
 import time
@@ -50,20 +50,28 @@ if not COOKIES_FILE.exists() and SECRET_COOKIES.exists():
 log.info("COOKIES_FILE = %s (exists=%s)", COOKIES_FILE, COOKIES_FILE.exists())
 # ====================
 
-URL_RE = re.compile(
-    r"https?://(?:www\.|m\.)?"
-    r"(?:youtube\.com/(?:watch\?v=|shorts/|live/)|youtu\.be/)"
-    r"[\w\-]{6,}"
-)
+# ===== РАСПОЗНАВАНИЕ ССЫЛОК ПО ПЛАТФОРМАМ =====
+PLATFORM_PATTERNS = [
+    ("youtube",   re.compile(r"https?://(?:www\.|m\.)?(?:youtube\.com|youtu\.be)/[\w\-?=&/%.]+")),
+    ("instagram", re.compile(r"https?://(?:www\.)?instagram\.com/(?:p|reel|reels|tv|share)/[\w\-?=&/%.]+")),
+    ("facebook",  re.compile(r"https?://(?:www\.|m\.|web\.|ru-ru\.)?(?:facebook\.com|fb\.watch|fb\.com)/[\w\-?=&/%.]+")),
+]
 
-# ===== СЧЁТЧИКИ ЗАДАЧ =====
-_semaphore  = asyncio.Semaphore(MAX_CONCURRENT)
-_stats_lock = asyncio.Lock()
-_active     = 0
-_waiting    = 0
-_finished   = 0
-_started_at = time.time()
-# ==========================
+PLATFORM_EMOJI = {
+    "youtube":   "▶️ YouTube",
+    "instagram": "📸 Instagram",
+    "facebook":  "📘 Facebook",
+}
+
+
+def detect_platform(text: str):
+    """Возвращает (platform, url) или (None, None)."""
+    for name, rx in PLATFORM_PATTERNS:
+        m = rx.search(text)
+        if m:
+            return name, m.group(0)
+    return None, None
+
 
 # ===== КЛАВИАТУРЫ =====
 REPLY_MENU = ReplyKeyboardMarkup(
@@ -73,10 +81,11 @@ REPLY_MENU = ReplyKeyboardMarkup(
         [KeyboardButton("📊 Статус"),      KeyboardButton("❌ Отмена")],
     ],
     resize_keyboard=True,
-    input_field_placeholder="Вставьте ссылку на YouTube…",
+    input_field_placeholder="Вставьте ссылку — YouTube / Instagram / Facebook…",
 )
 
-QUALITY_MENU = InlineKeyboardMarkup([
+# Для YouTube — расширенное меню качества
+YT_QUALITY_MENU = InlineKeyboardMarkup([
     [InlineKeyboardButton("🎬 1080p", callback_data="q:1080"),
      InlineKeyboardButton("🎬 720p",  callback_data="q:720")],
     [InlineKeyboardButton("🎬 480p",  callback_data="q:480"),
@@ -85,6 +94,14 @@ QUALITY_MENU = InlineKeyboardMarkup([
      InlineKeyboardButton("🎵 MP3",    callback_data="q:audio")],
     [InlineKeyboardButton("⬅️ Назад",  callback_data="q:back"),
      InlineKeyboardButton("❌ Отмена", callback_data="q:cancel")],
+])
+
+# Для Instagram / Facebook — простое меню (обычно один формат)
+SOCIAL_MENU = InlineKeyboardMarkup([
+    [InlineKeyboardButton("🎬 Скачать видео", callback_data="q:best")],
+    [InlineKeyboardButton("🎵 MP3",           callback_data="q:audio")],
+    [InlineKeyboardButton("⬅️ Назад",         callback_data="q:back"),
+     InlineKeyboardButton("❌ Отмена",        callback_data="q:cancel")],
 ])
 
 EMPTY_KB = InlineKeyboardMarkup([])
@@ -193,13 +210,11 @@ def _clean_err(e: Exception) -> str:
 
 async def _set_status(query, text: str):
     try:
-        await query.edit_message_text(text)
-        return
+        await query.edit_message_text(text); return
     except Exception:
         pass
     try:
-        await query.edit_message_caption(caption=text)
-        return
+        await query.edit_message_caption(caption=text); return
     except Exception:
         pass
     await query.message.reply_text(text)
@@ -213,6 +228,14 @@ async def _clear_keyboard(query):
 
 
 # ===== очередь =====
+_semaphore  = asyncio.Semaphore(MAX_CONCURRENT)
+_stats_lock = asyncio.Lock()
+_active     = 0
+_waiting    = 0
+_finished   = 0
+_started_at = time.time()
+
+
 async def _acquire_slot():
     global _active, _waiting
     async with _stats_lock:
@@ -235,10 +258,16 @@ async def _release_slot():
 async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     cookies_note = "🍪 Cookies: загружены" if COOKIES_FILE.exists() else "⚠️ Cookies: НЕТ"
     await update.message.reply_text(
-        "👋 Привет! Я качаю видео с YouTube.\n\n"
-        "Просто **пришлите ссылку** — я покажу превью и кнопки качества.\n\n"
+        "👋 Привет! Я качаю видео и музыку.\n\n"
+        "**Поддерживаю:**\n"
+        "▶️ YouTube (видео, Shorts, эфиры)\n"
+        "📸 Instagram (посты, Reels)\n"
+        "📘 Facebook (видео, Reels)\n\n"
+        "**Как пользоваться:**\n"
+        "1️⃣ Пришлите ссылку.\n"
+        "2️⃣ Выберите качество кнопкой.\n"
+        "3️⃣ Получите файл. 🎁\n\n"
         f"⚠️ Лимит файла — {MAX_SIZE_MB} МБ.\n"
-        f"⚙️ Одновременно обрабатывается до {MAX_CONCURRENT} задач.\n"
         f"{cookies_note}",
         parse_mode="Markdown",
         reply_markup=REPLY_MENU,
@@ -248,15 +277,16 @@ async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 async def cmd_help(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "📖 **Справка**\n\n"
-        "• Кинуть ссылку из YouTube / Shorts / youtu.be.\n"
-        "• Бот покажет превью и кнопки: 1080p / 720p / 480p / 360p / MP3.\n"
-        "• **⬅️ Назад** — ввести другую ссылку.\n\n"
-        "Команды:\n"
-        "/start — меню\n"
-        "/video <ссылка> — сразу 720p\n"
-        "/audio <ссылка> — сразу MP3\n"
-        "/status — статистика бота\n"
-        "/cancel — отменить ввод",
+        "**Поддерживаемые ссылки:**\n"
+        "• `youtube.com/watch?v=…` / `youtu.be/…`\n"
+        "• `youtube.com/shorts/…`\n"
+        "• `instagram.com/p/…`, `instagram.com/reel/…`\n"
+        "• `facebook.com/…`, `fb.watch/…`\n\n"
+        "**Кнопки качества:**\n"
+        "• На YouTube — 1080p / 720p / 480p / 360p / MP3\n"
+        "• На Instagram/Facebook — видео / MP3\n\n"
+        "⚠️ **Instagram и Facebook** часто требуют cookies — "
+        "если видео не скачивается, обновите `cookies.txt`.",
         parse_mode="Markdown",
         reply_markup=REPLY_MENU,
     )
@@ -264,6 +294,7 @@ async def cmd_help(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 async def cmd_cancel(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     ctx.user_data.pop("url", None)
+    ctx.user_data.pop("platform", None)
     await update.message.reply_text("Отменено.", reply_markup=REPLY_MENU)
 
 
@@ -284,33 +315,14 @@ async def cmd_status(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     )
 
 
-async def cmd_video(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    await _quick(update, ctx, "720")
-
-
-async def cmd_audio(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    await _quick(update, ctx, "audio")
-
-
-async def _quick(update: Update, ctx: ContextTypes.DEFAULT_TYPE, kind: str):
-    m = URL_RE.search(update.message.text or "")
-    if not m:
-        await update.message.reply_text(
-            "Пришлите ссылку вместе с командой:\n`/audio https://youtu.be/…`",
-            parse_mode="Markdown",
-            reply_markup=REPLY_MENU,
-        )
-        return
-    await _do_download(update, ctx, m.group(0), kind)
-
-
-# ===== кнопки меню (теперь БЕЗ быстрого пути) =====
+# ===== кнопки нижней панели =====
 async def handle_menu_button(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     text = (update.message.text or "").strip()
 
     if text == "🎬 Скачать видео":
         await update.message.reply_text(
-            "🎬 Пришлите ссылку — покажу варианты качества.",
+            "🎬 Пришлите ссылку — покажу варианты качества.\n"
+            "YouTube / Instagram / Facebook.",
             reply_markup=REPLY_MENU,
         )
         return
@@ -321,34 +333,30 @@ async def handle_menu_button(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         )
         return
     if text == "ℹ️ Помощь":
-        await cmd_help(update, ctx)
-        return
+        await cmd_help(update, ctx); return
     if text == "📊 Статус":
-        await cmd_status(update, ctx)
-        return
+        await cmd_status(update, ctx); return
     if text == "❌ Отмена":
-        await cmd_cancel(update, ctx)
-        return
+        await cmd_cancel(update, ctx); return
 
-    # Не кнопка — считаем ссылкой
     await handle_link(update, ctx)
 
 
-# ===== обработка ссылки + превью (всегда с меню качества) =====
+# ===== обработка ссылки + превью =====
 async def handle_link(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     text = update.message.text or ""
-    m = URL_RE.search(text)
-    if not m:
+    platform, url = detect_platform(text)
+    if not platform:
         await update.message.reply_text(
-            "🤔 Это не похоже на ссылку YouTube.\n"
-            "Пришлите ссылку вида `https://youtu.be/…`",
+            "🤔 Это не похоже на ссылку с поддерживаемых сайтов.\n\n"
+            "Поддерживаю: **YouTube**, **Instagram**, **Facebook**.",
             parse_mode="Markdown",
             reply_markup=REPLY_MENU,
         )
         return
 
-    url = m.group(0)
     ctx.user_data["url"] = url
+    ctx.user_data["platform"] = platform
 
     placeholder = await update.message.reply_text("🔍 Получаю информацию…")
     await ctx.bot.send_chat_action(update.message.chat_id, ChatAction.TYPING)
@@ -356,36 +364,36 @@ async def handle_link(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     try:
         info = await asyncio.get_running_loop().run_in_executor(None, _extract_info_sync, url)
     except Exception as e:
-        err = _clean_err(e)
-        await placeholder.edit_text(f"❌ Не удалось получить видео:\n{err}")
+        await placeholder.edit_text(f"❌ Не удалось получить видео:\n{_clean_err(e)}")
         return
 
     title    = _truncate(info.get("title") or "Видео", MAX_TITLE_LEN)
-    uploader = _truncate(info.get("uploader") or "", 40)
+    uploader = _truncate(info.get("uploader") or info.get("channel") or "", 40)
     dur      = _fmt_duration(info.get("duration"))
     thumb    = info.get("thumbnail")
 
-    lines = [f"🎬 {title}"]
+    lines = [f"{PLATFORM_EMOJI.get(platform, '🎬')} {title}"]
     if uploader: lines.append(f"👤 {uploader}")
     if dur:      lines.append(f"⏱ {dur}")
     lines.append("")
-    lines.append("Выберите качество:")
+    lines.append("Выберите:" if platform != "youtube" else "Выберите качество:")
     caption = "\n".join(lines)
+
+    # Разное меню для разных платформ
+    menu = YT_QUALITY_MENU if platform == "youtube" else SOCIAL_MENU
 
     await placeholder.delete()
     if thumb:
         try:
-            await update.message.reply_photo(
-                photo=thumb, caption=caption, reply_markup=QUALITY_MENU,
-            )
+            await update.message.reply_photo(photo=thumb, caption=caption, reply_markup=menu)
             return
         except Exception as e:
             log.warning("Не отправить превью: %s", e)
 
-    await update.message.reply_text(caption, reply_markup=QUALITY_MENU)
+    await update.message.reply_text(caption, reply_markup=menu)
 
 
-# ===== инлайн-кнопки =====
+# ===== инлайн-кнопки качества =====
 async def on_quality(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
@@ -394,17 +402,19 @@ async def on_quality(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
     if kind == "back":
         ctx.user_data.pop("url", None)
+        ctx.user_data.pop("platform", None)
         try:
             await query.edit_message_caption(caption="⬅️ Ок. Пришлите новую ссылку.", reply_markup=EMPTY_KB)
             return
         except Exception:
             pass
-        await _set_status(query, "⬅️ Ок. Пришлите новую ссылку.")
         await _clear_keyboard(query)
+        await _set_status(query, "⬅️ Ок. Пришлите новую ссылку.")
         return
 
     if kind == "cancel":
         ctx.user_data.pop("url", None)
+        ctx.user_data.pop("platform", None)
         await _clear_keyboard(query)
         await _set_status(query, "❌ Отменено.")
         return
@@ -419,7 +429,7 @@ async def on_quality(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await _do_download(update, ctx, url, kind, via_callback=True)
 
 
-# ===== скачивание =====
+# ===== скачивание и отправка =====
 async def _do_download(update: Update, ctx: ContextTypes.DEFAULT_TYPE,
                        url: str, kind: str, via_callback: bool = False):
     global _active, _waiting
@@ -449,10 +459,8 @@ async def _do_download(update: Update, ctx: ContextTypes.DEFAULT_TYPE,
 
         size_mb = path.stat().st_size / (1024 * 1024)
         if size_mb > MAX_SIZE_MB:
-            text = (
-                f"❌ Файл {size_mb:.1f} МБ — больше лимита Telegram ({MAX_SIZE_MB} МБ).\n"
-                f"Попробуйте качество поменьше или MP3."
-            )
+            text = (f"❌ Файл {size_mb:.1f} МБ — больше лимита Telegram "
+                    f"({MAX_SIZE_MB} МБ). Попробуйте MP3.")
             if via_callback:
                 await _set_status(query, text)
             else:
@@ -476,7 +484,7 @@ async def _do_download(update: Update, ctx: ContextTypes.DEFAULT_TYPE,
         await ctx.bot.send_message(chat_id, "Что дальше?", reply_markup=REPLY_MENU)
 
     except yt_dlp.utils.DownloadError as e:
-        text = f"❌ yt-dlp не смог скачать:\n{_clean_err(e)}"
+        text = f"❌ Не удалось скачать:\n{_clean_err(e)}"
         if via_callback:
             await ctx.bot.send_message(chat_id, text, reply_markup=REPLY_MENU)
         else:
@@ -511,7 +519,6 @@ def _start_health_server():
             self.send_header("Content-Type", "text/plain; charset=utf-8")
             self.end_headers()
             self.wfile.write(b"OK - bot is running")
-
         def log_message(self, *args):
             pass
 
@@ -523,20 +530,15 @@ def _start_health_server():
 async def post_init(app: Application):
     await app.bot.set_my_commands([
         BotCommand("start",  "🏠 Меню"),
-        BotCommand("video",  "🎬 Скачать видео (720p)"),
-        BotCommand("audio",  "🎵 Скачать MP3"),
-        BotCommand("status", "📊 Статистика"),
         BotCommand("help",   "ℹ️ Справка"),
+        BotCommand("status", "📊 Статистика"),
         BotCommand("cancel", "❌ Отмена"),
     ])
 
 
 def main():
     if not TOKEN:
-        raise SystemExit(
-            "Не задан BOT_TOKEN.\n"
-            'PowerShell: $env:BOT_TOKEN = "123456:ABC..."\n'
-        )
+        raise SystemExit("Не задан BOT_TOKEN.\n")
 
     if os.getenv("PORT"):
         Thread(target=_start_health_server, daemon=True).start()
@@ -558,8 +560,6 @@ def main():
     app.add_handler(CommandHandler("help",   cmd_help))
     app.add_handler(CommandHandler("cancel", cmd_cancel))
     app.add_handler(CommandHandler("status", cmd_status))
-    app.add_handler(CommandHandler("video",  cmd_video))
-    app.add_handler(CommandHandler("audio",  cmd_audio))
     app.add_handler(CallbackQueryHandler(on_quality, pattern=r"^q:"))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_menu_button))
 
