@@ -1,4 +1,4 @@
-# bot.py — YouTube + Instagram + Facebook
+# bot.py — YouTube + Instagram + Facebook + обязательная подписка
 import os
 import re
 import time
@@ -29,6 +29,14 @@ MAX_TITLE_LEN  = int(os.getenv("MAX_TITLE_LEN", "60"))
 DOWNLOAD_DIR   = Path(tempfile.gettempdir()) / "ytdl_bot"
 DOWNLOAD_DIR.mkdir(exist_ok=True)
 
+# ===== ОБЯЗАТЕЛЬНАЯ ПОДПИСКА =====
+REQUIRED_CHANNELS = ["@my_channel_bot"]
+
+CHANNEL_BUTTONS = {
+    "@my_channel_bot": "📢 Подписаться на канал",
+}
+# =====================================
+
 logging.basicConfig(
     format="%(asctime)s %(levelname)s %(name)s: %(message)s",
     level=logging.INFO,
@@ -50,7 +58,7 @@ if not COOKIES_FILE.exists() and SECRET_COOKIES.exists():
 log.info("COOKIES_FILE = %s (exists=%s)", COOKIES_FILE, COOKIES_FILE.exists())
 # ====================
 
-# ===== РАСПОЗНАВАНИЕ ССЫЛОК ПО ПЛАТФОРМАМ =====
+# ===== ПЛАТФОРМЫ =====
 PLATFORM_PATTERNS = [
     ("youtube",   re.compile(r"https?://(?:www\.|m\.)?(?:youtube\.com|youtu\.be)/[\w\-?=&/%.]+")),
     ("instagram", re.compile(r"https?://(?:www\.)?instagram\.com/(?:p|reel|reels|tv|share)/[\w\-?=&/%.]+")),
@@ -65,12 +73,42 @@ PLATFORM_EMOJI = {
 
 
 def detect_platform(text: str):
-    """Возвращает (platform, url) или (None, None)."""
     for name, rx in PLATFORM_PATTERNS:
         m = rx.search(text)
         if m:
             return name, m.group(0)
     return None, None
+
+
+# ===== ПРОВЕРКА ПОДПИСКИ =====
+async def check_subscription(bot, user_id: int):
+    not_subscribed = []
+    for channel in REQUIRED_CHANNELS:
+        try:
+            member = await bot.get_chat_member(chat_id=channel, user_id=user_id)
+            if member.status in ("left", "kicked"):
+                not_subscribed.append(channel)
+        except Exception as e:
+            log.warning("Не проверить подписку на %s: %s", channel, e)
+            not_subscribed.append(channel)
+    return not_subscribed
+
+
+def subscription_keyboard(not_subscribed: list) -> InlineKeyboardMarkup:
+    rows = []
+    for ch in not_subscribed:
+        name = CHANNEL_BUTTONS.get(ch, f"📢 Подписаться на {ch}")
+        link = f"https://t.me/{ch.lstrip('@')}"
+        rows.append([InlineKeyboardButton(name, url=link)])
+    rows.append([InlineKeyboardButton("✅ Я подписался", callback_data="check_sub")])
+    return InlineKeyboardMarkup(rows)
+
+
+SUBSCRIPTION_TEXT = (
+    "👋 Привет!\n\n"
+    "Чтобы пользоваться ботом, подпишитесь на канал(ы) ниже:\n\n"
+    "После подписки нажмите **✅ Я подписался**."
+)
 
 
 # ===== КЛАВИАТУРЫ =====
@@ -84,7 +122,6 @@ REPLY_MENU = ReplyKeyboardMarkup(
     input_field_placeholder="Вставьте ссылку — YouTube / Instagram / Facebook…",
 )
 
-# Для YouTube — расширенное меню качества
 YT_QUALITY_MENU = InlineKeyboardMarkup([
     [InlineKeyboardButton("🎬 1080p", callback_data="q:1080"),
      InlineKeyboardButton("🎬 720p",  callback_data="q:720")],
@@ -96,7 +133,6 @@ YT_QUALITY_MENU = InlineKeyboardMarkup([
      InlineKeyboardButton("❌ Отмена", callback_data="q:cancel")],
 ])
 
-# Для Instagram / Facebook — простое меню (обычно один формат)
 SOCIAL_MENU = InlineKeyboardMarkup([
     [InlineKeyboardButton("🎬 Скачать видео", callback_data="q:best")],
     [InlineKeyboardButton("🎵 MP3",           callback_data="q:audio")],
@@ -164,7 +200,6 @@ def download_sync(url: str, kind: str) -> Path:
     job_dir.mkdir(exist_ok=True)
 
     out_tpl = str(job_dir / "%(title).120B [%(id)s].%(ext)s")
-
     with yt_dlp.YoutubeDL(_ydl_opts(kind, out_tpl)) as ydl:
         info = ydl.extract_info(url, download=True)
         path = Path(ydl.prepare_filename(info))
@@ -227,6 +262,20 @@ async def _clear_keyboard(query):
         pass
 
 
+async def _require_subscription(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> bool:
+    user_id = update.effective_user.id
+    not_sub = await check_subscription(ctx.bot, user_id)
+    if not_sub:
+        await ctx.bot.send_message(
+            chat_id=update.effective_chat.id,
+            text=SUBSCRIPTION_TEXT,
+            reply_markup=subscription_keyboard(not_sub),
+            parse_mode="Markdown",
+        )
+        return False
+    return True
+
+
 # ===== очередь =====
 _semaphore  = asyncio.Semaphore(MAX_CONCURRENT)
 _stats_lock = asyncio.Lock()
@@ -256,16 +305,18 @@ async def _release_slot():
 
 # ===== команды =====
 async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    if not await _require_subscription(update, ctx):
+        return
     cookies_note = "🍪 Cookies: загружены" if COOKIES_FILE.exists() else "⚠️ Cookies: НЕТ"
     await update.message.reply_text(
         "👋 Привет! Я качаю видео и музыку.\n\n"
         "**Поддерживаю:**\n"
-        "▶️ YouTube (видео, Shorts, эфиры)\n"
-        "📸 Instagram (посты, Reels)\n"
-        "📘 Facebook (видео, Reels)\n\n"
+        "▶️ YouTube\n"
+        "📸 Instagram\n"
+        "📘 Facebook\n\n"
         "**Как пользоваться:**\n"
         "1️⃣ Пришлите ссылку.\n"
-        "2️⃣ Выберите качество кнопкой.\n"
+        "2️⃣ Выберите качество.\n"
         "3️⃣ Получите файл. 🎁\n\n"
         f"⚠️ Лимит файла — {MAX_SIZE_MB} МБ.\n"
         f"{cookies_note}",
@@ -275,18 +326,18 @@ async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 
 async def cmd_help(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    if not await _require_subscription(update, ctx):
+        return
     await update.message.reply_text(
         "📖 **Справка**\n\n"
         "**Поддерживаемые ссылки:**\n"
-        "• `youtube.com/watch?v=…` / `youtu.be/…`\n"
-        "• `youtube.com/shorts/…`\n"
-        "• `instagram.com/p/…`, `instagram.com/reel/…`\n"
-        "• `facebook.com/…`, `fb.watch/…`\n\n"
-        "**Кнопки качества:**\n"
-        "• На YouTube — 1080p / 720p / 480p / 360p / MP3\n"
-        "• На Instagram/Facebook — видео / MP3\n\n"
-        "⚠️ **Instagram и Facebook** часто требуют cookies — "
-        "если видео не скачивается, обновите `cookies.txt`.",
+        "• YouTube (watch / shorts / youtu.be)\n"
+        "• Instagram (reels / p)\n"
+        "• Facebook (fb.watch / facebook.com)\n\n"
+        "**Качество:**\n"
+        "• YouTube — 1080p / 720p / 480p / 360p / MP3\n"
+        "• Instagram / Facebook — видео / MP3\n\n"
+        "⚠️ Лимит Telegram — 50 МБ.",
         parse_mode="Markdown",
         reply_markup=REPLY_MENU,
     )
@@ -317,12 +368,14 @@ async def cmd_status(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 # ===== кнопки нижней панели =====
 async def handle_menu_button(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    if not await _require_subscription(update, ctx):
+        return
+
     text = (update.message.text or "").strip()
 
     if text == "🎬 Скачать видео":
         await update.message.reply_text(
-            "🎬 Пришлите ссылку — покажу варианты качества.\n"
-            "YouTube / Instagram / Facebook.",
+            "🎬 Пришлите ссылку — покажу варианты качества.",
             reply_markup=REPLY_MENU,
         )
         return
@@ -348,9 +401,8 @@ async def handle_link(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     platform, url = detect_platform(text)
     if not platform:
         await update.message.reply_text(
-            "🤔 Это не похоже на ссылку с поддерживаемых сайтов.\n\n"
-            "Поддерживаю: **YouTube**, **Instagram**, **Facebook**.",
-            parse_mode="Markdown",
+            "🤔 Это не похоже на ссылку.\n"
+            "Поддерживаю: YouTube, Instagram, Facebook.",
             reply_markup=REPLY_MENU,
         )
         return
@@ -376,10 +428,9 @@ async def handle_link(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if uploader: lines.append(f"👤 {uploader}")
     if dur:      lines.append(f"⏱ {dur}")
     lines.append("")
-    lines.append("Выберите:" if platform != "youtube" else "Выберите качество:")
+    lines.append("Выберите качество:" if platform == "youtube" else "Выберите:")
     caption = "\n".join(lines)
 
-    # Разное меню для разных платформ
     menu = YT_QUALITY_MENU if platform == "youtube" else SOCIAL_MENU
 
     await placeholder.delete()
@@ -393,12 +444,39 @@ async def handle_link(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(caption, reply_markup=menu)
 
 
-# ===== инлайн-кнопки качества =====
+# ===== инлайн-кнопки =====
 async def on_quality(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
 
     kind = query.data.split(":", 1)[1]
+
+    if kind == "check_sub":
+        not_sub = await check_subscription(ctx.bot, query.from_user.id)
+        if not_sub:
+            try:
+                await query.answer("Вы ещё не подписаны 😐", show_alert=True)
+            except Exception:
+                pass
+            try:
+                await query.edit_message_text(
+                    SUBSCRIPTION_TEXT,
+                    reply_markup=subscription_keyboard(not_sub),
+                    parse_mode="Markdown",
+                )
+            except Exception:
+                pass
+        else:
+            try:
+                await query.edit_message_text("✅ Спасибо за подписку! Теперь пришлите ссылку.")
+            except Exception:
+                pass
+            await ctx.bot.send_message(
+                query.message.chat_id,
+                "Отправьте ссылку — покажу варианты качества.",
+                reply_markup=REPLY_MENU,
+            )
+        return
 
     if kind == "back":
         ctx.user_data.pop("url", None)
@@ -419,6 +497,20 @@ async def on_quality(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await _set_status(query, "❌ Отменено.")
         return
 
+    not_sub = await check_subscription(ctx.bot, query.from_user.id)
+    if not_sub:
+        try:
+            await query.edit_message_reply_markup(reply_markup=EMPTY_KB)
+        except Exception:
+            pass
+        await ctx.bot.send_message(
+            query.message.chat_id,
+            SUBSCRIPTION_TEXT,
+            reply_markup=subscription_keyboard(not_sub),
+            parse_mode="Markdown",
+        )
+        return
+
     url = ctx.user_data.get("url")
     if not url:
         await _set_status(query, "Ссылка потерялась, пришлите её заново.")
@@ -429,7 +521,7 @@ async def on_quality(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await _do_download(update, ctx, url, kind, via_callback=True)
 
 
-# ===== скачивание и отправка =====
+# ===== скачивание =====
 async def _do_download(update: Update, ctx: ContextTypes.DEFAULT_TYPE,
                        url: str, kind: str, via_callback: bool = False):
     global _active, _waiting
@@ -507,7 +599,7 @@ async def _do_download(update: Update, ctx: ContextTypes.DEFAULT_TYPE,
         await _release_slot()
 
 
-# ===== health-сервер (для Render) =====
+# ===== health-сервер =====
 def _start_health_server():
     port = int(os.getenv("PORT", "0"))
     if not port:
