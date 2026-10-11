@@ -6,6 +6,7 @@ import asyncio
 import logging
 import tempfile
 import shutil
+import urllib.request
 from pathlib import Path
 from threading import Thread
 from http.server import BaseHTTPRequestHandler, HTTPServer
@@ -58,6 +59,17 @@ logging.basicConfig(
     level=logging.INFO,
 )
 log = logging.getLogger("ytdl-bot")
+
+
+# ===== ВНЕШНИЙ IP (для добавления в whitelist Proxy6) =====
+def _log_external_ip():
+    try:
+        with urllib.request.urlopen("https://api.ipify.org", timeout=10) as r:
+            ip = r.read().decode().strip()
+            log.info("EXTERNAL_IP = %s", ip)
+    except Exception as e:
+        log.warning("Не узнать внешний IP: %s", e)
+
 
 # ===== COOKIES =====
 COOKIES_FILE = Path(__file__).parent / "cookies.txt"
@@ -177,7 +189,8 @@ def _base_opts() -> dict:
         "quiet": True,
         "no_warnings": True,
         "retries": 5,
-        "socket_timeout": 60,
+        "socket_timeout": 60,       # увеличили для медленного прокси
+        "source_address": "0.0.0.0",
     }
     if COOKIES_FILE.exists():
         opts["cookiefile"] = str(COOKIES_FILE)
@@ -552,7 +565,7 @@ async def on_quality(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await _do_download(update, ctx, url, kind, via_callback=True)
 
 
-# ===== скачивание с авто-понижением =====
+# ===== скачивание =====
 async def _do_download(update: Update, ctx: ContextTypes.DEFAULT_TYPE,
                        url: str, kind: str, via_callback: bool = False):
     global _active, _waiting
@@ -585,8 +598,7 @@ async def _do_download(update: Update, ctx: ContextTypes.DEFAULT_TYPE,
                 status_text = f"⏳ Скачиваю ({QUALITY_LABEL.get(try_kind, try_kind)})…"
             else:
                 status_text = (
-                    f"⏳ Файл не влез в {MAX_SIZE_MB} МБ.\n"
-                    f"Пробую {QUALITY_LABEL.get(try_kind, try_kind)}…"
+                    f"⏳ Файл не влез. Пробую {QUALITY_LABEL.get(try_kind, try_kind)}…"
                 )
             if via_callback:
                 await _set_status(query, status_text)
@@ -634,8 +646,7 @@ async def _do_download(update: Update, ctx: ContextTypes.DEFAULT_TYPE,
 
         if not sent:
             text = (
-                f"❌ Даже в самом лёгком формате файл не влез в {MAX_SIZE_MB} МБ.\n"
-                f"Попробуйте другое видео или скачайте только звук."
+                f"❌ Даже в самом лёгком формате файл не влез в {MAX_SIZE_MB} МБ."
             )
             if via_callback:
                 await ctx.bot.send_message(chat_id, text, reply_markup=REPLY_MENU)
@@ -693,6 +704,9 @@ async def post_init(app: Application):
 def main():
     if not TOKEN:
         raise SystemExit("Не задан BOT_TOKEN.\n")
+
+    # Логируем внешний IP при старте — для whitelist Proxy6
+    Thread(target=_log_external_ip, daemon=True).start()
 
     if os.getenv("PORT"):
         Thread(target=_start_health_server, daemon=True).start()
