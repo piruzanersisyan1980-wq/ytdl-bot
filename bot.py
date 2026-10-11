@@ -1,4 +1,4 @@
-# bot.py — YouTube + Instagram + Facebook + подписка + авто-понижение качества
+# bot.py — YouTube + Instagram + Facebook + подписка + авто-понижение + прокси
 import os
 import re
 import time
@@ -26,19 +26,18 @@ TOKEN          = os.getenv("BOT_TOKEN")
 MAX_SIZE_MB    = int(os.getenv("MAX_SIZE_MB", "50"))
 MAX_CONCURRENT = int(os.getenv("MAX_CONCURRENT", "3"))
 MAX_TITLE_LEN  = int(os.getenv("MAX_TITLE_LEN", "60"))
+PROXY_URL      = os.getenv("PROXY_URL", "").strip()
 DOWNLOAD_DIR   = Path(tempfile.gettempdir()) / "ytdl_bot"
 DOWNLOAD_DIR.mkdir(exist_ok=True)
 
 # ===== ОБЯЗАТЕЛЬНАЯ ПОДПИСКА =====
 REQUIRED_CHANNELS = ["@edrikevideo"]
-
 CHANNEL_BUTTONS = {
     "@edrikevideo": "📢 Подписаться на канал",
 }
 # =====================================
 
-# ===== АВТО-ПОНИЖЕНИЕ КАЧЕСТВА =====
-# Что пробовать, если файл не влез в лимит Telegram
+# ===== АВТО-ПОНИЖЕНИЕ =====
 FALLBACK_ORDER = {
     "1080":  ["720", "480", "360", "audio"],
     "720":   ["480", "360", "audio"],
@@ -49,14 +48,10 @@ FALLBACK_ORDER = {
 }
 
 QUALITY_LABEL = {
-    "1080": "1080p",
-    "720":  "720p",
-    "480":  "480p",
-    "360":  "360p",
-    "best": "лучшее",
-    "audio": "MP3",
+    "1080": "1080p", "720": "720p", "480": "480p",
+    "360": "360p", "best": "лучшее", "audio": "MP3",
 }
-# =====================================
+# ==========================
 
 logging.basicConfig(
     format="%(asctime)s %(levelname)s %(name)s: %(message)s",
@@ -77,6 +72,7 @@ if not COOKIES_FILE.exists() and SECRET_COOKIES.exists():
         COOKIES_FILE = SECRET_COOKIES
 
 log.info("COOKIES_FILE = %s (exists=%s)", COOKIES_FILE, COOKIES_FILE.exists())
+log.info("PROXY_URL set: %s", "yes" if PROXY_URL else "no")
 # ====================
 
 # ===== ПЛАТФОРМЫ =====
@@ -185,6 +181,8 @@ def _base_opts() -> dict:
     }
     if COOKIES_FILE.exists():
         opts["cookiefile"] = str(COOKIES_FILE)
+    if PROXY_URL:
+        opts["proxy"] = PROXY_URL
     return opts
 
 
@@ -338,6 +336,7 @@ async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not await _require_subscription(update, ctx):
         return
     cookies_note = "🍪 Cookies: загружены" if COOKIES_FILE.exists() else "⚠️ Cookies: НЕТ"
+    proxy_note = "🌍 Прокси: вкл" if PROXY_URL else "🌍 Прокси: выкл"
     await update.message.reply_text(
         "👋 Привет! Я качаю видео и музыку.\n\n"
         "**Поддерживаю:**\n"
@@ -349,7 +348,7 @@ async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         "2️⃣ Выберите качество.\n"
         "3️⃣ Получите файл. 🎁\n\n"
         f"⚠️ Лимит файла — {MAX_SIZE_MB} МБ. Если больше — я сам понижу качество.\n"
-        f"{cookies_note}",
+        f"{cookies_note}\n{proxy_note}",
         parse_mode="Markdown",
         reply_markup=REPLY_MENU,
     )
@@ -367,9 +366,7 @@ async def cmd_help(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         "**Качество:**\n"
         "• YouTube — 1080p / 720p / 480p / 360p / MP3\n"
         "• Instagram / Facebook — видео / MP3\n\n"
-        "**Если файл >50 МБ:**\n"
-        "Бот сам понижает качество до тех пор, пока файл не влезет. "
-        "Просто подождите.",
+        "**Если файл >50 МБ:** Бот сам понижает качество.",
         parse_mode="Markdown",
         reply_markup=REPLY_MENU,
     )
@@ -386,12 +383,14 @@ async def cmd_status(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         a, w, f = _active, _waiting, _finished
     uptime = int(time.time() - _started_at)
     cookies_state = "✅ загружены" if COOKIES_FILE.exists() else "❌ нет"
+    proxy_state = "✅ вкл" if PROXY_URL else "❌ выкл"
     await update.message.reply_text(
         f"📊 **Статус бота**\n\n"
         f"🟢 Активных задач: {a}/{MAX_CONCURRENT}\n"
         f"⏳ В очереди: {w}\n"
         f"✅ Всего скачано: {f}\n"
         f"🍪 Cookies: {cookies_state}\n"
+        f"🌍 Прокси: {proxy_state}\n"
         f"⏱ Аптайм: {_fmt_uptime(uptime)}",
         parse_mode="Markdown",
         reply_markup=REPLY_MENU,
@@ -577,15 +576,11 @@ async def _do_download(update: Update, ctx: ContextTypes.DEFAULT_TYPE,
     await _acquire_slot()
 
     loop = asyncio.get_running_loop()
-    current_kind = kind
     attempts = [kind] + FALLBACK_ORDER.get(kind, [])
     sent = False
 
     try:
         for idx, try_kind in enumerate(attempts):
-            current_kind = try_kind
-
-            # Обновляем статус при понижении
             if idx == 0:
                 status_text = f"⏳ Скачиваю ({QUALITY_LABEL.get(try_kind, try_kind)})…"
             else:
@@ -606,7 +601,6 @@ async def _do_download(update: Update, ctx: ContextTypes.DEFAULT_TYPE,
                 size_mb = path.stat().st_size / (1024 * 1024)
 
                 if size_mb <= MAX_SIZE_MB:
-                    # Влезло — отправляем
                     if via_callback:
                         try:
                             await ctx.bot.delete_message(chat_id, msg.message_id)
@@ -617,8 +611,7 @@ async def _do_download(update: Update, ctx: ContextTypes.DEFAULT_TYPE,
                         if try_kind == "audio":
                             await ctx.bot.send_audio(
                                 chat_id=chat_id, audio=f,
-                                title=path.stem,
-                                caption="🎵 Готово!",
+                                title=path.stem, caption="🎵 Готово!",
                             )
                         else:
                             await ctx.bot.send_video(
@@ -630,8 +623,7 @@ async def _do_download(update: Update, ctx: ContextTypes.DEFAULT_TYPE,
                     sent = True
                     break
                 else:
-                    # Не влезло — чистим и пробуем ниже
-                    log.info("Файл %.1f МБ > %d МБ — понижаю качество (%s)",
+                    log.info("Файл %.1f МБ > %d МБ — понижаю (%s)",
                              size_mb, MAX_SIZE_MB, try_kind)
                     _cleanup_job(path)
                     path = None
