@@ -1,4 +1,4 @@
-# bot.py — YouTube + Instagram + Facebook + подписка + авто-понижение + прокси
+# bot.py — YouTube + Instagram + Facebook + подписка + авто-понижение + прокси (только YouTube)
 import os
 import re
 import time
@@ -6,8 +6,8 @@ import asyncio
 import logging
 import tempfile
 import shutil
-import urllib.request
 from pathlib import Path
+from urllib.parse import urlsplit
 from threading import Thread
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
@@ -59,17 +59,6 @@ logging.basicConfig(
     level=logging.INFO,
 )
 log = logging.getLogger("ytdl-bot")
-
-
-# ===== ВНЕШНИЙ IP (для добавления в whitelist Proxy6) =====
-def _log_external_ip():
-    try:
-        with urllib.request.urlopen("https://api.ipify.org", timeout=10) as r:
-            ip = r.read().decode().strip()
-            log.info("EXTERNAL_IP = %s", ip)
-    except Exception as e:
-        log.warning("Не узнать внешний IP: %s", e)
-
 
 # ===== COOKIES =====
 COOKIES_FILE = Path(__file__).parent / "cookies.txt"
@@ -183,25 +172,36 @@ QUALITY_FORMATS = {
 }
 
 
-def _base_opts() -> dict:
+def _is_youtube(url: str) -> bool:
+    """Прокси применяем только к YouTube."""
+    host = (urlsplit(url).hostname or "").lower()
+    return (
+        host == "youtu.be"
+        or host == "youtube.com"
+        or host.endswith(".youtube.com")
+    )
+
+
+def _base_opts(url: str = "") -> dict:
     opts = {
         "noplaylist": True,
         "quiet": True,
         "no_warnings": True,
         "retries": 5,
-        "socket_timeout": 60,       # увеличили для медленного прокси
-        "source_address": "0.0.0.0",
+        "socket_timeout": 60,
     }
     if COOKIES_FILE.exists():
         opts["cookiefile"] = str(COOKIES_FILE)
-    if PROXY_URL:
+    # Прокси только для YouTube — Instagram/Facebook работают напрямую
+    if PROXY_URL and _is_youtube(url):
         opts["proxy"] = PROXY_URL
     return opts
 
 
-def _ydl_opts(kind: str, out_tpl: str) -> dict:
-    opts = _base_opts()
+def _ydl_opts(kind: str, out_tpl: str, url: str) -> dict:
+    opts = _base_opts(url)
     opts["outtmpl"] = out_tpl
+
     if kind == "audio":
         opts.update({
             "format": QUALITY_FORMATS["audio"],
@@ -216,12 +216,14 @@ def _ydl_opts(kind: str, out_tpl: str) -> dict:
             "format": QUALITY_FORMATS.get(kind, QUALITY_FORMATS["720"]),
             "merge_output_format": "mp4",
         })
+
     return opts
 
 
 def _extract_info_sync(url: str) -> dict:
-    opts = _base_opts()
+    opts = _base_opts(url)
     opts["skip_download"] = True
+
     with yt_dlp.YoutubeDL(opts) as ydl:
         return ydl.extract_info(url, download=False)
 
@@ -232,7 +234,8 @@ def download_sync(url: str, kind: str) -> Path:
     job_dir.mkdir(exist_ok=True)
 
     out_tpl = str(job_dir / "%(title).120B [%(id)s].%(ext)s")
-    with yt_dlp.YoutubeDL(_ydl_opts(kind, out_tpl)) as ydl:
+
+    with yt_dlp.YoutubeDL(_ydl_opts(kind, out_tpl, url)) as ydl:
         info = ydl.extract_info(url, download=True)
         path = Path(ydl.prepare_filename(info))
 
@@ -245,6 +248,7 @@ def download_sync(url: str, kind: str) -> Path:
             path = found[0]
         else:
             raise FileNotFoundError(f"Файл не найден: {path}")
+
     return path
 
 
@@ -286,11 +290,13 @@ def _clean_err(e: Exception) -> str:
 
 async def _set_status(query, text: str):
     try:
-        await query.edit_message_text(text); return
+        await query.edit_message_text(text)
+        return
     except Exception:
         pass
     try:
-        await query.edit_message_caption(caption=text); return
+        await query.edit_message_caption(caption=text)
+        return
     except Exception:
         pass
     await query.message.reply_text(text)
@@ -349,7 +355,7 @@ async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not await _require_subscription(update, ctx):
         return
     cookies_note = "🍪 Cookies: загружены" if COOKIES_FILE.exists() else "⚠️ Cookies: НЕТ"
-    proxy_note = "🌍 Прокси: вкл" if PROXY_URL else "🌍 Прокси: выкл"
+    proxy_note = "🌍 Прокси: вкл (только YouTube)" if PROXY_URL else "🌍 Прокси: выкл"
     await update.message.reply_text(
         "👋 Привет! Я качаю видео и музыку.\n\n"
         "**Поддерживаю:**\n"
@@ -396,7 +402,7 @@ async def cmd_status(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         a, w, f = _active, _waiting, _finished
     uptime = int(time.time() - _started_at)
     cookies_state = "✅ загружены" if COOKIES_FILE.exists() else "❌ нет"
-    proxy_state = "✅ вкл" if PROXY_URL else "❌ выкл"
+    proxy_state = "✅ вкл (только YouTube)" if PROXY_URL else "❌ выкл"
     await update.message.reply_text(
         f"📊 **Статус бота**\n\n"
         f"🟢 Активных задач: {a}/{MAX_CONCURRENT}\n"
@@ -430,11 +436,14 @@ async def handle_menu_button(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         )
         return
     if text == "ℹ️ Помощь":
-        await cmd_help(update, ctx); return
+        await cmd_help(update, ctx)
+        return
     if text == "📊 Статус":
-        await cmd_status(update, ctx); return
+        await cmd_status(update, ctx)
+        return
     if text == "❌ Отмена":
-        await cmd_cancel(update, ctx); return
+        await cmd_cancel(update, ctx)
+        return
 
     await handle_link(update, ctx)
 
@@ -469,8 +478,10 @@ async def handle_link(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     thumb    = info.get("thumbnail")
 
     lines = [f"{PLATFORM_EMOJI.get(platform, '🎬')} {title}"]
-    if uploader: lines.append(f"👤 {uploader}")
-    if dur:      lines.append(f"⏱ {dur}")
+    if uploader:
+        lines.append(f"👤 {uploader}")
+    if dur:
+        lines.append(f"⏱ {dur}")
     lines.append("")
     lines.append("Выберите качество:" if platform == "youtube" else "Выберите:")
     caption = "\n".join(lines)
@@ -480,7 +491,9 @@ async def handle_link(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await placeholder.delete()
     if thumb:
         try:
-            await update.message.reply_photo(photo=thumb, caption=caption, reply_markup=menu)
+            await update.message.reply_photo(
+                photo=thumb, caption=caption, reply_markup=menu,
+            )
             return
         except Exception as e:
             log.warning("Не отправить превью: %s", e)
@@ -526,7 +539,9 @@ async def on_quality(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         ctx.user_data.pop("url", None)
         ctx.user_data.pop("platform", None)
         try:
-            await query.edit_message_caption(caption="⬅️ Ок. Пришлите новую ссылку.", reply_markup=EMPTY_KB)
+            await query.edit_message_caption(
+                caption="⬅️ Ок. Пришлите новую ссылку.", reply_markup=EMPTY_KB,
+            )
             return
         except Exception:
             pass
@@ -598,7 +613,8 @@ async def _do_download(update: Update, ctx: ContextTypes.DEFAULT_TYPE,
                 status_text = f"⏳ Скачиваю ({QUALITY_LABEL.get(try_kind, try_kind)})…"
             else:
                 status_text = (
-                    f"⏳ Файл не влез. Пробую {QUALITY_LABEL.get(try_kind, try_kind)}…"
+                    f"⏳ Файл не влез в {MAX_SIZE_MB} МБ.\n"
+                    f"Пробую {QUALITY_LABEL.get(try_kind, try_kind)}…"
                 )
             if via_callback:
                 await _set_status(query, status_text)
@@ -635,8 +651,10 @@ async def _do_download(update: Update, ctx: ContextTypes.DEFAULT_TYPE,
                     sent = True
                     break
                 else:
-                    log.info("Файл %.1f МБ > %d МБ — понижаю (%s)",
-                             size_mb, MAX_SIZE_MB, try_kind)
+                    log.info(
+                        "Файл %.1f МБ > %d МБ — понижаю (%s)",
+                        size_mb, MAX_SIZE_MB, try_kind,
+                    )
                     _cleanup_job(path)
                     path = None
                     continue
@@ -684,6 +702,7 @@ def _start_health_server():
             self.send_header("Content-Type", "text/plain; charset=utf-8")
             self.end_headers()
             self.wfile.write(b"OK - bot is running")
+
         def log_message(self, *args):
             pass
 
@@ -704,9 +723,6 @@ async def post_init(app: Application):
 def main():
     if not TOKEN:
         raise SystemExit("Не задан BOT_TOKEN.\n")
-
-    # Логируем внешний IP при старте — для whitelist Proxy6
-    Thread(target=_log_external_ip, daemon=True).start()
 
     if os.getenv("PORT"):
         Thread(target=_start_health_server, daemon=True).start()
