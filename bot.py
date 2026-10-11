@@ -1,4 +1,4 @@
-# bot.py — YouTube + Instagram + Facebook + подписка на @edrikevideo
+# bot.py — YouTube + Instagram + Facebook + подписка + авто-понижение качества
 import os
 import re
 import time
@@ -34,6 +34,27 @@ REQUIRED_CHANNELS = ["@edrikevideo"]
 
 CHANNEL_BUTTONS = {
     "@edrikevideo": "📢 Подписаться на канал",
+}
+# =====================================
+
+# ===== АВТО-ПОНИЖЕНИЕ КАЧЕСТВА =====
+# Что пробовать, если файл не влез в лимит Telegram
+FALLBACK_ORDER = {
+    "1080":  ["720", "480", "360", "audio"],
+    "720":   ["480", "360", "audio"],
+    "480":   ["360", "audio"],
+    "360":   ["audio"],
+    "best":  ["720", "480", "360", "audio"],
+    "audio": [],
+}
+
+QUALITY_LABEL = {
+    "1080": "1080p",
+    "720":  "720p",
+    "480":  "480p",
+    "360":  "360p",
+    "best": "лучшее",
+    "audio": "MP3",
 }
 # =====================================
 
@@ -216,6 +237,15 @@ def download_sync(url: str, kind: str) -> Path:
     return path
 
 
+def _cleanup_job(path: Path):
+    try:
+        for f in path.parent.glob("*"):
+            f.unlink(missing_ok=True)
+        path.parent.rmdir()
+    except Exception:
+        pass
+
+
 # ===== утилиты =====
 def _truncate(text: str, n: int) -> str:
     text = (text or "").strip()
@@ -318,7 +348,7 @@ async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         "1️⃣ Пришлите ссылку.\n"
         "2️⃣ Выберите качество.\n"
         "3️⃣ Получите файл. 🎁\n\n"
-        f"⚠️ Лимит файла — {MAX_SIZE_MB} МБ.\n"
+        f"⚠️ Лимит файла — {MAX_SIZE_MB} МБ. Если больше — я сам понижу качество.\n"
         f"{cookies_note}",
         parse_mode="Markdown",
         reply_markup=REPLY_MENU,
@@ -337,7 +367,9 @@ async def cmd_help(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         "**Качество:**\n"
         "• YouTube — 1080p / 720p / 480p / 360p / MP3\n"
         "• Instagram / Facebook — видео / MP3\n\n"
-        "⚠️ Лимит Telegram — 50 МБ.",
+        "**Если файл >50 МБ:**\n"
+        "Бот сам понижает качество до тех пор, пока файл не влезет. "
+        "Просто подождите.",
         parse_mode="Markdown",
         reply_markup=REPLY_MENU,
     )
@@ -517,11 +549,11 @@ async def on_quality(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         return
 
     await _clear_keyboard(query)
-    await _set_status(query, f"⏳ Готовлю скачивание ({kind})…")
+    await _set_status(query, f"⏳ Готовлю скачивание ({QUALITY_LABEL.get(kind, kind)})…")
     await _do_download(update, ctx, url, kind, via_callback=True)
 
 
-# ===== скачивание =====
+# ===== скачивание с авто-понижением =====
 async def _do_download(update: Update, ctx: ContextTypes.DEFAULT_TYPE,
                        url: str, kind: str, via_callback: bool = False):
     global _active, _waiting
@@ -543,37 +575,82 @@ async def _do_download(update: Update, ctx: ContextTypes.DEFAULT_TYPE,
             await msg.reply_text(queue_text, reply_markup=REPLY_MENU)
 
     await _acquire_slot()
-    path = None
-    try:
-        await ctx.bot.send_chat_action(chat_id, ChatAction.UPLOAD_VIDEO)
-        loop = asyncio.get_running_loop()
-        path = await loop.run_in_executor(None, download_sync, url, kind)
 
-        size_mb = path.stat().st_size / (1024 * 1024)
-        if size_mb > MAX_SIZE_MB:
-            text = (f"❌ Файл {size_mb:.1f} МБ — больше лимита Telegram "
-                    f"({MAX_SIZE_MB} МБ). Попробуйте MP3.")
+    loop = asyncio.get_running_loop()
+    current_kind = kind
+    attempts = [kind] + FALLBACK_ORDER.get(kind, [])
+    sent = False
+
+    try:
+        for idx, try_kind in enumerate(attempts):
+            current_kind = try_kind
+
+            # Обновляем статус при понижении
+            if idx == 0:
+                status_text = f"⏳ Скачиваю ({QUALITY_LABEL.get(try_kind, try_kind)})…"
+            else:
+                status_text = (
+                    f"⏳ Файл не влез в {MAX_SIZE_MB} МБ.\n"
+                    f"Пробую {QUALITY_LABEL.get(try_kind, try_kind)}…"
+                )
             if via_callback:
-                await _set_status(query, text)
+                await _set_status(query, status_text)
+            else:
+                await msg.reply_text(status_text, reply_markup=REPLY_MENU)
+
+            await ctx.bot.send_chat_action(chat_id, ChatAction.UPLOAD_VIDEO)
+
+            path = None
+            try:
+                path = await loop.run_in_executor(None, download_sync, url, try_kind)
+                size_mb = path.stat().st_size / (1024 * 1024)
+
+                if size_mb <= MAX_SIZE_MB:
+                    # Влезло — отправляем
+                    if via_callback:
+                        try:
+                            await ctx.bot.delete_message(chat_id, msg.message_id)
+                        except Exception:
+                            pass
+
+                    with open(path, "rb") as f:
+                        if try_kind == "audio":
+                            await ctx.bot.send_audio(
+                                chat_id=chat_id, audio=f,
+                                title=path.stem,
+                                caption="🎵 Готово!",
+                            )
+                        else:
+                            await ctx.bot.send_video(
+                                chat_id=chat_id, video=f,
+                                supports_streaming=True,
+                                caption=f"🎬 Готово! ({QUALITY_LABEL.get(try_kind, try_kind)})",
+                            )
+
+                    sent = True
+                    break
+                else:
+                    # Не влезло — чистим и пробуем ниже
+                    log.info("Файл %.1f МБ > %d МБ — понижаю качество (%s)",
+                             size_mb, MAX_SIZE_MB, try_kind)
+                    _cleanup_job(path)
+                    path = None
+                    continue
+            finally:
+                if path is not None:
+                    _cleanup_job(path)
+
+        if not sent:
+            text = (
+                f"❌ Даже в самом лёгком формате файл не влез в {MAX_SIZE_MB} МБ.\n"
+                f"Попробуйте другое видео или скачайте только звук."
+            )
+            if via_callback:
+                await ctx.bot.send_message(chat_id, text, reply_markup=REPLY_MENU)
             else:
                 await msg.reply_text(text, reply_markup=REPLY_MENU)
-            return
-
-        if via_callback:
-            try:
-                await ctx.bot.delete_message(chat_id, msg.message_id)
-            except Exception:
-                pass
-
-        with open(path, "rb") as f:
-            if kind == "audio":
-                await ctx.bot.send_audio(chat_id=chat_id, audio=f,
-                                         title=path.stem, caption="🎵 Готово!")
-            else:
-                await ctx.bot.send_video(chat_id=chat_id, video=f,
-                                         supports_streaming=True, caption="🎬 Готово!")
-
-        await ctx.bot.send_message(chat_id, "Что дальше?", reply_markup=REPLY_MENU)
+        else:
+            await ctx.bot.send_message(chat_id, "Что дальше?", reply_markup=REPLY_MENU)
 
     except yt_dlp.utils.DownloadError as e:
         text = f"❌ Не удалось скачать:\n{_clean_err(e)}"
@@ -589,13 +666,6 @@ async def _do_download(update: Update, ctx: ContextTypes.DEFAULT_TYPE,
         else:
             await msg.reply_text(text, reply_markup=REPLY_MENU)
     finally:
-        if path is not None:
-            try:
-                for f in path.parent.glob("*"):
-                    f.unlink(missing_ok=True)
-                path.parent.rmdir()
-            except Exception:
-                pass
         await _release_slot()
 
 
