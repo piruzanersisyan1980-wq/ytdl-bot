@@ -177,7 +177,7 @@ def _base_opts() -> dict:
         "quiet": True,
         "no_warnings": True,
         "retries": 5,
-        "socket_timeout": 30,
+        "socket_timeout": 60,
     }
     if COOKIES_FILE.exists():
         opts["cookiefile"] = str(COOKIES_FILE)
