@@ -1,3 +1,4 @@
+# bot.py — YouTube + Instagram + Facebook Telegram bot
 import os
 import re
 import time
@@ -29,9 +30,11 @@ MAX_CONCURRENT = int(os.getenv("MAX_CONCURRENT", "2"))
 PROXY_URL      = os.getenv("PROXY_URL", "").strip()
 PROGRESS_EVERY = float(os.getenv("PROGRESS_EVERY", "3"))  # сек между обновлениями
 
-CHANNEL       = "@edrikevideo"
-CHANNEL_URL   = "https://t.me/edrikevideo"
-DOWNLOAD_DIR  = Path(tempfile.gettempdir()) / "ytdl_bot"
+CHANNEL              = "@edrikevideo"
+CHANNEL_URL          = "https://t.me/edrikevideo"
+CONTACT_CHANNEL_TEXT = "напиши @edrikevideo"
+
+DOWNLOAD_DIR = Path(tempfile.gettempdir()) / "ytdl_bot"
 DOWNLOAD_DIR.mkdir(parents=True, exist_ok=True)
 
 logging.basicConfig(
@@ -76,6 +79,16 @@ PLATFORM_NAMES = {
     "instagram": "📸 Instagram",
     "facebook": "📘 Facebook",
 }
+
+
+# ---------- Ошибка ----------
+def unavailable_message() -> str:
+    return (
+        "🛑 Ошибка скачивания!\n"
+        "Этот видеоролик недоступен.\n"
+        "Попробуй повторить запрос.\n"
+        f"Если видео не загрузилось, {CONTACT_CHANNEL_TEXT}."
+    )
 
 
 def detect_platform(text: str):
@@ -188,17 +201,13 @@ def human_size(num_bytes) -> str:
     if not num_bytes:
         return "?"
     mb = num_bytes / (1024 * 1024)
-    if mb < 100:
-        return f"{mb:.1f} MB"
-    return f"{mb:.0f} MB"
+    return f"{mb:.1f} MB" if mb < 100 else f"{mb:.0f} MB"
 
 
 class ProgressHook:
-    """Обновляет сообщение со статусом прогресса загрузки."""
-
     def __init__(self, loop, updater, label: str):
         self.loop = loop
-        self.updater = updater          # async def updater(text)
+        self.updater = updater
         self.label = label
         self.last_ts = 0.0
         self.last_percent = -1.0
@@ -232,8 +241,9 @@ class ProgressHook:
                 self.last_percent = percent
 
                 bar = make_bar(percent)
-                speed = d.get("_speed_str", "").strip()
-                eta = d.get("_eta_str", "").strip()
+                speed = (d.get("_speed_str") or "").strip()
+                eta = (d.get("_eta_str") or "").strip()
+
                 head = f"🎬 {self.label}"
                 if self.total:
                     head += f" 💾 {human_size(self.total)}"
@@ -249,7 +259,6 @@ class ProgressHook:
                 if self.total:
                     head += f" 💾 {human_size(self.total)}"
                 self._post(f"{head}\n\n🔄 Обрабатываю файл…")
-
         except Exception:
             log.debug("Ошибка progress hook", exc_info=True)
 
@@ -486,8 +495,8 @@ async def handle_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             "Возможно, сайт недоступен или прокси не отвечает."
         )
         return
-    except Exception as error:
-        await info_message.edit_text(f"❌ Не удалось получить информацию:\n{clean_error(error)}")
+    except Exception:
+        await info_message.edit_text(unavailable_message())
         return
 
     title = truncate(info.get("title") or "Видео", 60)
@@ -580,6 +589,7 @@ async def download_and_send(update, ctx, url, requested_kind, via_callback=False
     await acquire_slot()
     success = False
     loop = asyncio.get_running_loop()
+    last_error = None
 
     try:
         for index, kind in enumerate(attempts):
@@ -588,7 +598,6 @@ async def download_and_send(update, ctx, url, requested_kind, via_callback=False
             if index:
                 head = f"🎬 {label}\n\n⏳ Предыдущий формат не подошёл, пробую снова…"
 
-            # Готовим "живое" сообщение, которое будем обновлять
             if via_callback:
                 try:
                     await query.edit_message_text(head)
@@ -598,12 +607,11 @@ async def download_and_send(update, ctx, url, requested_kind, via_callback=False
             else:
                 progress_msg = await message.reply_text(head)
 
-            # Замыкание для обновления
-            async def update_progress(text: str):
+            async def update_progress(text: str, _msg=progress_msg):
                 try:
                     await ctx.bot.edit_message_text(
-                        chat_id=progress_msg.chat_id,
-                        message_id=progress_msg.message_id,
+                        chat_id=_msg.chat_id,
+                        message_id=_msg.message_id,
                         text=text,
                     )
                 except Exception:
@@ -654,29 +662,26 @@ async def download_and_send(update, ctx, url, requested_kind, via_callback=False
                 return
 
             except yt_dlp.utils.DownloadError as error:
+                last_error = error
                 log.warning("Формат %s недоступен: %s", kind, clean_error(error))
-                if index == len(attempts) - 1:
-                    raise
                 try:
                     await ctx.bot.delete_message(progress_msg.chat_id, progress_msg.message_id)
                 except Exception:
                     pass
+                if index == len(attempts) - 1:
+                    raise
             finally:
                 cleanup_file(path)
 
-        await ctx.bot.send_message(
-            chat_id,
-            f"❌ Не удалось подобрать файл меньше {MAX_SIZE_MB} МБ.",
-            reply_markup=REPLY_MENU,
-        )
+        # Если дошли сюда — все форматы не подошли по размеру
+        await ctx.bot.send_message(chat_id, unavailable_message(), reply_markup=REPLY_MENU)
 
-    except Exception as error:
+    except yt_dlp.utils.DownloadError as error:
+        log.warning("Не удалось скачать: %s", clean_error(error))
+        await ctx.bot.send_message(chat_id, unavailable_message(), reply_markup=REPLY_MENU)
+    except Exception:
         log.exception("Ошибка скачивания")
-        await ctx.bot.send_message(
-            chat_id,
-            f"❌ Не удалось скачать:\n{clean_error(error)}",
-            reply_markup=REPLY_MENU,
-        )
+        await ctx.bot.send_message(chat_id, unavailable_message(), reply_markup=REPLY_MENU)
     finally:
         await release_slot(success)
 
