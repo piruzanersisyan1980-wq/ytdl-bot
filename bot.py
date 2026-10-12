@@ -1,4 +1,3 @@
-# bot.py — YouTube + Instagram + Facebook Telegram bot
 import os
 import re
 import time
@@ -14,33 +13,25 @@ from http.server import BaseHTTPRequestHandler, HTTPServer
 
 import yt_dlp
 from telegram import (
-    Update,
-    InlineKeyboardButton,
-    InlineKeyboardMarkup,
-    ReplyKeyboardMarkup,
-    KeyboardButton,
-    BotCommand,
+    Update, InlineKeyboardButton, InlineKeyboardMarkup,
+    ReplyKeyboardMarkup, KeyboardButton, BotCommand,
 )
 from telegram.constants import ChatAction
 from telegram.ext import (
-    Application,
-    CommandHandler,
-    MessageHandler,
-    CallbackQueryHandler,
-    ContextTypes,
-    filters,
+    Application, CommandHandler, MessageHandler,
+    CallbackQueryHandler, ContextTypes, filters,
 )
 
-# ---------- Настройки (значения берутся из Render Environment) ----------
-TOKEN = os.getenv("BOT_TOKEN")
-MAX_SIZE_MB = int(os.getenv("MAX_SIZE_MB", "48"))
+# ---------- Настройки ----------
+TOKEN          = os.getenv("BOT_TOKEN")
+MAX_SIZE_MB    = int(os.getenv("MAX_SIZE_MB", "48"))
 MAX_CONCURRENT = int(os.getenv("MAX_CONCURRENT", "2"))
-PROXY_URL = os.getenv("PROXY_URL", "").strip()
+PROXY_URL      = os.getenv("PROXY_URL", "").strip()
+PROGRESS_EVERY = float(os.getenv("PROGRESS_EVERY", "3"))  # сек между обновлениями
 
-CHANNEL = "@edrikevideo"
-CHANNEL_URL = "https://t.me/edrikevideo"
-
-DOWNLOAD_DIR = Path(tempfile.gettempdir()) / "ytdl_bot"
+CHANNEL       = "@edrikevideo"
+CHANNEL_URL   = "https://t.me/edrikevideo"
+DOWNLOAD_DIR  = Path(tempfile.gettempdir()) / "ytdl_bot"
 DOWNLOAD_DIR.mkdir(parents=True, exist_ok=True)
 
 logging.basicConfig(
@@ -50,9 +41,9 @@ logging.basicConfig(
 log = logging.getLogger("ytdl-bot")
 
 # ---------- Cookies ----------
-LOCAL_COOKIES = Path(__file__).parent / "cookies.txt"
+LOCAL_COOKIES  = Path(__file__).parent / "cookies.txt"
 SECRET_COOKIES = Path("/etc/secrets/cookies.txt")
-TEMP_COOKIES = Path(tempfile.gettempdir()) / "ytdl_bot_cookies.txt"
+TEMP_COOKIES   = Path(tempfile.gettempdir()) / "ytdl_bot_cookies.txt"
 
 COOKIES_FILE = None
 if SECRET_COOKIES.exists():
@@ -71,16 +62,13 @@ log.info("Прокси настроен: %s", bool(PROXY_URL))
 PLATFORM_PATTERNS = [
     ("youtube", re.compile(
         r"https?://(?:www\.|m\.)?(?:youtube\.com|youtu\.be)/[\w\-?=&/%.]+",
-        re.IGNORECASE,
-    )),
+        re.IGNORECASE)),
     ("instagram", re.compile(
         r"https?://(?:www\.)?instagram\.com/(?:p|reel|reels|tv|share)/[\w\-?=&/%.]+",
-        re.IGNORECASE,
-    )),
+        re.IGNORECASE)),
     ("facebook", re.compile(
         r"https?://(?:(?:www|m|web|ru-ru)\.)?(?:facebook\.com|fb\.watch|fb\.com)/[\w\-?=&/%.]+",
-        re.IGNORECASE,
-    )),
+        re.IGNORECASE)),
 ]
 
 PLATFORM_NAMES = {
@@ -104,9 +92,7 @@ def platform_from_url(url: str) -> str:
         return "youtube"
     if host == "instagram.com" or host.endswith(".instagram.com"):
         return "instagram"
-    if host == "facebook.com" or host.endswith(".facebook.com"):
-        return "facebook"
-    if host == "fb.watch" or host.endswith(".fb.watch"):
+    if host == "facebook.com" or host.endswith(".facebook.com") or host.endswith(".fb.watch"):
         return "facebook"
     return "other"
 
@@ -131,10 +117,9 @@ def subscription_keyboard() -> InlineKeyboardMarkup:
 async def require_subscription(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> bool:
     if await check_subscription(ctx.bot, update.effective_user.id):
         return True
-
     await update.effective_message.reply_text(
-        "Чтобы пользоваться ботом, подпишитесь на канал "
-        "@edrikevideo, затем нажмите «✅ Я подписался».",
+        "Чтобы пользоваться ботом, подпишитесь на канал @edrikevideo, "
+        "затем нажмите «✅ Я подписался».",
         reply_markup=subscription_keyboard(),
     )
     return False
@@ -152,78 +137,137 @@ REPLY_MENU = ReplyKeyboardMarkup(
 )
 
 YOUTUBE_MENU = InlineKeyboardMarkup([
-    [
-        InlineKeyboardButton("🎬 1080p", callback_data="q:1080"),
-        InlineKeyboardButton("🎬 720p", callback_data="q:720"),
-    ],
-    [
-        InlineKeyboardButton("🎬 480p", callback_data="q:480"),
-        InlineKeyboardButton("🎬 360p", callback_data="q:360"),
-    ],
-    [
-        InlineKeyboardButton("⭐ Лучшее", callback_data="q:best"),
-        InlineKeyboardButton("🎵 MP3", callback_data="q:audio"),
-    ],
-    [
-        InlineKeyboardButton("⬅️ Назад", callback_data="q:back"),
-        InlineKeyboardButton("❌ Отмена", callback_data="q:cancel"),
-    ],
+    [InlineKeyboardButton("🎬 1080p", callback_data="q:1080"),
+     InlineKeyboardButton("🎬 720p",  callback_data="q:720")],
+    [InlineKeyboardButton("🎬 480p",  callback_data="q:480"),
+     InlineKeyboardButton("🎬 360p",  callback_data="q:360")],
+    [InlineKeyboardButton("⭐ Лучшее", callback_data="q:best"),
+     InlineKeyboardButton("🎵 MP3",    callback_data="q:audio")],
+    [InlineKeyboardButton("⬅️ Назад",  callback_data="q:back"),
+     InlineKeyboardButton("❌ Отмена", callback_data="q:cancel")],
 ])
 
 SOCIAL_MENU = InlineKeyboardMarkup([
     [InlineKeyboardButton("🎬 Скачать видео", callback_data="q:best")],
-    [InlineKeyboardButton("🎵 MP3", callback_data="q:audio")],
-    [
-        InlineKeyboardButton("⬅️ Назад", callback_data="q:back"),
-        InlineKeyboardButton("❌ Отмена", callback_data="q:cancel"),
-    ],
+    [InlineKeyboardButton("🎵 MP3",           callback_data="q:audio")],
+    [InlineKeyboardButton("⬅️ Назад",         callback_data="q:back"),
+     InlineKeyboardButton("❌ Отмена",        callback_data="q:cancel")],
 ])
 
 QUALITY_LABELS = {
-    "1080": "1080p",
-    "720": "720p",
-    "480": "480p",
-    "360": "360p",
-    "best": "лучшее качество",
-    "audio": "MP3",
+    "1080": "1080p", "720": "720p", "480": "480p",
+    "360": "360p", "best": "лучшее качество", "audio": "MP3",
 }
 
 YOUTUBE_FORMATS = {
     "1080": "bv*[height<=1080]+ba/b[height<=1080]",
-    "720": "bv*[height<=720]+ba/b[height<=720]",
-    "480": "bv*[height<=480]+ba/b[height<=480]",
-    "360": "bv*[height<=360]+ba/b[height<=360]",
+    "720":  "bv*[height<=720]+ba/b[height<=720]",
+    "480":  "bv*[height<=480]+ba/b[height<=480]",
+    "360":  "bv*[height<=360]+ba/b[height<=360]",
     "best": "bv*+ba/b",
     "audio": "bestaudio/best",
 }
 
 YOUTUBE_FALLBACKS = {
     "1080": ["720", "480", "360", "audio"],
-    "720": ["480", "360", "audio"],
-    "480": ["360", "audio"],
-    "360": ["audio"],
+    "720":  ["480", "360", "audio"],
+    "480":  ["360", "audio"],
+    "360":  ["audio"],
     "best": ["720", "480", "360", "audio"],
     "audio": [],
 }
 
 
-# ---------- yt-dlp ----------
-def ydl_options(url: str, kind: str, output_template: str) -> dict:
-    platform = platform_from_url(url)
+# ---------- Прогресс ----------
+def make_bar(percent: float, length: int = 10) -> str:
+    filled = max(0, min(length, int(round(length * percent / 100))))
+    return "■" * filled + "□" * (length - filled)
 
+
+def human_size(num_bytes) -> str:
+    if not num_bytes:
+        return "?"
+    mb = num_bytes / (1024 * 1024)
+    if mb < 100:
+        return f"{mb:.1f} MB"
+    return f"{mb:.0f} MB"
+
+
+class ProgressHook:
+    """Обновляет сообщение со статусом прогресса загрузки."""
+
+    def __init__(self, loop, updater, label: str):
+        self.loop = loop
+        self.updater = updater          # async def updater(text)
+        self.label = label
+        self.last_ts = 0.0
+        self.last_percent = -1.0
+        self.total = 0
+
+    def _post(self, text: str):
+        try:
+            asyncio.run_coroutine_threadsafe(self.updater(text), self.loop)
+        except Exception:
+            log.debug("Не удалось поставить прогресс", exc_info=True)
+
+    def __call__(self, d):
+        try:
+            if d.get("status") == "downloading":
+                total = d.get("total_bytes") or d.get("total_bytes_estimate") or 0
+                if total:
+                    self.total = total
+                downloaded = d.get("downloaded_bytes") or 0
+                if self.total:
+                    percent = downloaded * 100.0 / self.total
+                else:
+                    try:
+                        percent = float((d.get("_percent_str") or "0%").strip().rstrip("%"))
+                    except Exception:
+                        percent = 0.0
+
+                now = time.time()
+                if now - self.last_ts < PROGRESS_EVERY and abs(percent - self.last_percent) < 5:
+                    return
+                self.last_ts = now
+                self.last_percent = percent
+
+                bar = make_bar(percent)
+                speed = d.get("_speed_str", "").strip()
+                eta = d.get("_eta_str", "").strip()
+                head = f"🎬 {self.label}"
+                if self.total:
+                    head += f" 💾 {human_size(self.total)}"
+                body = f"📥 Скачиваю:\n{bar} {percent:.0f}%"
+                if speed and speed != "N/A":
+                    body += f"\n⚡ {speed}"
+                if eta and eta != "N/A":
+                    body += f"   ⏱ {eta}"
+                self._post(f"{head}\n\n{body}")
+
+            elif d.get("status") == "finished":
+                head = f"🎬 {self.label}"
+                if self.total:
+                    head += f" 💾 {human_size(self.total)}"
+                self._post(f"{head}\n\n🔄 Обрабатываю файл…")
+
+        except Exception:
+            log.debug("Ошибка progress hook", exc_info=True)
+
+
+# ---------- yt-dlp ----------
+def ydl_options(url: str, kind: str, output_template: str, hook=None) -> dict:
+    platform = platform_from_url(url)
     opts = {
         "outtmpl": output_template,
         "noplaylist": True,
         "quiet": True,
         "no_warnings": True,
         "retries": 3,
-        "socket_timeout": 60,
+        "socket_timeout": 20,
+        "progress_hooks": [hook] if hook else [],
     }
-
     if COOKIES_FILE and COOKIES_FILE.exists():
         opts["cookiefile"] = str(COOKIES_FILE)
-
-    # Прокси используется только для YouTube
     if PROXY_URL and platform == "youtube":
         opts["proxy"] = PROXY_URL
 
@@ -238,12 +282,9 @@ def ydl_options(url: str, kind: str, output_template: str) -> dict:
         opts["format"] = YOUTUBE_FORMATS.get(kind, YOUTUBE_FORMATS["best"])
         opts["merge_output_format"] = "mp4"
     else:
-        # Instagram/Facebook: лучший видео + лучший аудио поток,
-        # сортировка сначала по разрешению, затем по битрейту
         opts["format"] = "bv*+ba/b"
         opts["format_sort"] = ["res", "br"]
         opts["merge_output_format"] = "mp4"
-
     return opts
 
 
@@ -254,23 +295,22 @@ def extract_info_sync(url: str) -> dict:
         "noplaylist": True,
         "quiet": True,
         "no_warnings": True,
-        "socket_timeout": 45,
+        "socket_timeout": 20,
     }
     if COOKIES_FILE and COOKIES_FILE.exists():
         opts["cookiefile"] = str(COOKIES_FILE)
     if PROXY_URL and platform == "youtube":
         opts["proxy"] = PROXY_URL
-
     with yt_dlp.YoutubeDL(opts) as ydl:
         return ydl.extract_info(url, download=False)
 
 
-def download_sync(url: str, kind: str) -> Path:
+def download_sync(url: str, kind: str, hook=None) -> Path:
     job_dir = DOWNLOAD_DIR / uuid.uuid4().hex
     job_dir.mkdir(parents=True, exist_ok=True)
     template = str(job_dir / "%(title).100B [%(id)s].%(ext)s")
 
-    with yt_dlp.YoutubeDL(ydl_options(url, kind, template)) as ydl:
+    with yt_dlp.YoutubeDL(ydl_options(url, kind, template, hook)) as ydl:
         info = ydl.extract_info(url, download=True)
         expected = Path(ydl.prepare_filename(info))
 
@@ -278,17 +318,13 @@ def download_sync(url: str, kind: str) -> Path:
         mp3_files = list(job_dir.glob("*.mp3"))
         if mp3_files:
             return mp3_files[0]
-
     if expected.exists():
         return expected
 
-    candidates = [
-        p for p in job_dir.iterdir()
-        if p.is_file() and not p.name.endswith((".part", ".ytdl"))
-    ]
+    candidates = [p for p in job_dir.iterdir()
+                  if p.is_file() and not p.name.endswith((".part", ".ytdl"))]
     if candidates:
         return max(candidates, key=lambda p: p.stat().st_size)
-
     raise FileNotFoundError("После скачивания файл не найден")
 
 
@@ -305,7 +341,7 @@ def cleanup_file(path):
         log.warning("Не удалось очистить временную папку %s", path.parent)
 
 
-# ---------- Форматирование и состояние ----------
+# ---------- Утилиты ----------
 def truncate(text: str, limit: int) -> str:
     text = (text or "").strip()
     return text if len(text) <= limit else text[:limit - 1].rstrip() + "…"
@@ -315,9 +351,9 @@ def format_duration(seconds) -> str:
     if not seconds:
         return ""
     seconds = int(seconds)
-    hours, remainder = divmod(seconds, 3600)
-    minutes, secs = divmod(remainder, 60)
-    return f"{hours}:{minutes:02d}:{secs:02d}" if hours else f"{minutes}:{secs:02d}"
+    h, rem = divmod(seconds, 3600)
+    m, s = divmod(rem, 60)
+    return f"{h}:{m:02d}:{s:02d}" if h else f"{m}:{s:02d}"
 
 
 def clean_error(error: Exception) -> str:
@@ -326,9 +362,9 @@ def clean_error(error: Exception) -> str:
 
 
 def format_uptime(seconds: int) -> str:
-    hours, remainder = divmod(seconds, 3600)
-    minutes, _ = divmod(remainder, 60)
-    return f"{hours}ч {minutes}м"
+    h, rem = divmod(seconds, 3600)
+    m, _ = divmod(rem, 60)
+    return f"{h}ч {m}м"
 
 
 semaphore = asyncio.Semaphore(MAX_CONCURRENT)
@@ -358,30 +394,17 @@ async def release_slot(success: bool):
     semaphore.release()
 
 
-async def edit_status(query, text: str):
-    try:
-        await query.edit_message_text(text)
-    except Exception:
-        try:
-            await query.edit_message_caption(caption=text)
-        except Exception:
-            await query.message.reply_text(text)
-
-
-# ---------- Команды бота ----------
+# ---------- Команды ----------
 async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not await require_subscription(update, ctx):
         return
-
-    cookie_status = "есть" if COOKIES_FILE and COOKIES_FILE.exists() else "нет"
-    proxy_status = "включён для YouTube" if PROXY_URL else "выключен"
-
+    cookies_note = "есть" if COOKIES_FILE and COOKIES_FILE.exists() else "нет"
+    proxy_note = "включён для YouTube" if PROXY_URL else "выключен"
     await update.message.reply_text(
-        "👋 Привет! Отправьте ссылку на YouTube, Instagram или Facebook.\n"
-        "После ссылки покажу доступные варианты.\n\n"
-        f"Лимит отправки Telegram: около {MAX_SIZE_MB} МБ.\n"
-        f"Cookies: {cookie_status}.\n"
-        f"Прокси: {proxy_status}.",
+        "👋 Привет! Отправьте ссылку на YouTube, Instagram или Facebook.\n\n"
+        f"Лимит Telegram: около {MAX_SIZE_MB} МБ.\n"
+        f"Cookies: {cookies_note}.\n"
+        f"Прокси: {proxy_note}.",
         reply_markup=REPLY_MENU,
     )
 
@@ -390,10 +413,9 @@ async def cmd_help(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not await require_subscription(update, ctx):
         return
     await update.message.reply_text(
-        "Отправьте ссылку на видео — бот покажет доступные варианты.\n"
-        "YouTube: выбор качества и MP3.\n"
-        "Instagram/Facebook: видео или MP3.\n"
-        "Большие видео бот попробует загрузить в более низком качестве.",
+        "Отправьте ссылку — бот покажет варианты скачивания.\n"
+        "YouTube: качество и MP3. Instagram/Facebook: видео или MP3.\n"
+        "Большие видео бот качает в пониженном качестве.",
         reply_markup=REPLY_MENU,
     )
 
@@ -402,18 +424,16 @@ async def cmd_status(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not await require_subscription(update, ctx):
         return
     async with stats_lock:
-        active, waiting, completed = active_jobs, waiting_jobs, completed_jobs
-
-    cookie_status = "✅ загружены" if COOKIES_FILE and COOKIES_FILE.exists() else "❌ нет"
-    proxy_status = "✅ включён для YouTube" if PROXY_URL else "❌ выключен"
-
+        a, w, c = active_jobs, waiting_jobs, completed_jobs
+    cookies_note = "✅ загружены" if COOKIES_FILE and COOKIES_FILE.exists() else "❌ нет"
+    proxy_note = "✅ вкл (YouTube)" if PROXY_URL else "❌ выкл"
     await update.message.reply_text(
         f"📊 Статус\n"
-        f"Активных задач: {active}/{MAX_CONCURRENT}\n"
-        f"В очереди: {waiting}\n"
-        f"Успешно отправлено: {completed}\n"
-        f"Cookies: {cookie_status}\n"
-        f"Прокси: {proxy_status}\n"
+        f"Активных задач: {a}/{MAX_CONCURRENT}\n"
+        f"В очереди: {w}\n"
+        f"Успешно отправлено: {c}\n"
+        f"Cookies: {cookies_note}\n"
+        f"Прокси: {proxy_note}\n"
         f"Аптайм: {format_uptime(int(time.time() - started_at))}",
         reply_markup=REPLY_MENU,
     )
@@ -425,27 +445,22 @@ async def cmd_cancel(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("Отменено.", reply_markup=REPLY_MENU)
 
 
+# ---------- Обработка ссылки ----------
 async def handle_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not await require_subscription(update, ctx):
         return
 
     text = (update.message.text or "").strip()
-
     if text == "🎬 Скачать видео":
-        await update.message.reply_text("Пришлите ссылку на видео.", reply_markup=REPLY_MENU)
-        return
+        await update.message.reply_text("Пришлите ссылку на видео.", reply_markup=REPLY_MENU); return
     if text == "🎵 Скачать MP3":
-        await update.message.reply_text("Пришлите ссылку; затем выберите MP3.", reply_markup=REPLY_MENU)
-        return
+        await update.message.reply_text("Пришлите ссылку; затем выберите MP3.", reply_markup=REPLY_MENU); return
     if text == "ℹ️ Помощь":
-        await cmd_help(update, ctx)
-        return
+        await cmd_help(update, ctx); return
     if text == "📊 Статус":
-        await cmd_status(update, ctx)
-        return
+        await cmd_status(update, ctx); return
     if text == "❌ Отмена":
-        await cmd_cancel(update, ctx)
-        return
+        await cmd_cancel(update, ctx); return
 
     platform, url = detect_platform(text)
     if not platform:
@@ -459,44 +474,42 @@ async def handle_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     ctx.user_data["platform"] = platform
 
     info_message = await update.message.reply_text("🔍 Получаю информацию…")
+    loop = asyncio.get_running_loop()
     try:
-        info = await asyncio.get_running_loop().run_in_executor(
-            None, extract_info_sync, url
+        info = await asyncio.wait_for(
+            loop.run_in_executor(None, extract_info_sync, url),
+            timeout=40,
         )
-    except Exception as error:
+    except asyncio.TimeoutError:
         await info_message.edit_text(
-            f"❌ Не удалось получить информацию:\n{clean_error(error)}"
+            "⏱ Не удалось получить данные за 40 секунд. "
+            "Возможно, сайт недоступен или прокси не отвечает."
         )
+        return
+    except Exception as error:
+        await info_message.edit_text(f"❌ Не удалось получить информацию:\n{clean_error(error)}")
         return
 
     title = truncate(info.get("title") or "Видео", 60)
     uploader = truncate(info.get("uploader") or info.get("channel") or "", 40)
     duration = format_duration(info.get("duration"))
 
-    caption_lines = [f"{PLATFORM_NAMES[platform]}: {title}"]
-    if uploader:
-        caption_lines.append(f"👤 {uploader}")
-    if duration:
-        caption_lines.append(f"⏱ {duration}")
-    caption_lines.append("")
-    caption_lines.append(
-        "Выберите качество:" if platform == "youtube" else "Выберите действие:"
-    )
-    caption = "\n".join(caption_lines)
+    lines = [f"{PLATFORM_NAMES[platform]}: {title}"]
+    if uploader: lines.append(f"👤 {uploader}")
+    if duration: lines.append(f"⏱ {duration}")
+    lines.append("")
+    lines.append("Выберите качество:" if platform == "youtube" else "Выберите действие:")
+    caption = "\n".join(lines)
     keyboard = YOUTUBE_MENU if platform == "youtube" else SOCIAL_MENU
 
     await info_message.delete()
-    thumbnail = info.get("thumbnail")
-    if thumbnail:
+    thumb = info.get("thumbnail")
+    if thumb:
         try:
-            await update.message.reply_photo(
-                photo=thumbnail,
-                caption=caption,
-                reply_markup=keyboard,
-            )
+            await update.message.reply_photo(photo=thumb, caption=caption, reply_markup=keyboard)
             return
         except Exception:
-            log.exception("Не удалось отправить превью")
+            log.exception("Не отправить превью")
 
     await update.message.reply_text(caption, reply_markup=keyboard)
 
@@ -509,9 +522,7 @@ async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if data == "sub:check":
         if await check_subscription(ctx.bot, query.from_user.id):
             await query.answer("Подписка подтверждена")
-            await query.message.reply_text(
-                "Спасибо! Теперь отправьте ссылку.", reply_markup=REPLY_MENU
-            )
+            await query.message.reply_text("Спасибо! Теперь отправьте ссылку.", reply_markup=REPLY_MENU)
         else:
             await query.answer("Сначала подпишитесь на канал.", show_alert=True)
         return
@@ -526,10 +537,12 @@ async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             await query.edit_message_reply_markup(reply_markup=None)
         except Exception:
             pass
-        await edit_status(
-            query,
-            "⬅️ Пришлите новую ссылку." if action == "back" else "❌ Отменено.",
-        )
+        try:
+            await query.edit_message_text(
+                "⬅️ Пришлите новую ссылку." if action == "back" else "❌ Отменено."
+            )
+        except Exception:
+            pass
         return
 
     if not await check_subscription(ctx.bot, query.from_user.id):
@@ -541,20 +554,17 @@ async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
     url = ctx.user_data.get("url")
     if not url:
-        await edit_status(query, "Ссылка устарела. Пришлите её ещё раз.")
+        try:
+            await query.edit_message_text("Ссылка устарела. Пришлите её ещё раз.")
+        except Exception:
+            pass
         return
 
     await download_and_send(update, ctx, url, action, via_callback=True)
 
 
-# ---------- Скачивание, авто-понижение и отправка ----------
-async def download_and_send(
-    update: Update,
-    ctx: ContextTypes.DEFAULT_TYPE,
-    url: str,
-    requested_kind: str,
-    via_callback: bool = False,
-):
+# ---------- Скачивание с прогрессом ----------
+async def download_and_send(update, ctx, url, requested_kind, via_callback=False):
     query = update.callback_query if via_callback else None
     message = query.message if query else update.effective_message
     chat_id = message.chat_id
@@ -569,27 +579,42 @@ async def download_and_send(
 
     await acquire_slot()
     success = False
+    loop = asyncio.get_running_loop()
 
     try:
         for index, kind in enumerate(attempts):
             label = QUALITY_LABELS.get(kind, kind)
-            status = f"⏳ Загружаю {label}…"
+            head = f"🎬 {label}\n\n📥 Готовлю загрузку…"
             if index:
-                status = f"Файл слишком большой или формат недоступен. Пробую {label}…"
+                head = f"🎬 {label}\n\n⏳ Предыдущий формат не подошёл, пробую снова…"
 
-            status_message = None
+            # Готовим "живое" сообщение, которое будем обновлять
             if via_callback:
-                await edit_status(query, status)
+                try:
+                    await query.edit_message_text(head)
+                    progress_msg = query.message
+                except Exception:
+                    progress_msg = await ctx.bot.send_message(chat_id, head)
             else:
-                status_message = await message.reply_text(status)
+                progress_msg = await message.reply_text(head)
 
-            await ctx.bot.send_chat_action(chat_id, ChatAction.UPLOAD_DOCUMENT)
+            # Замыкание для обновления
+            async def update_progress(text: str):
+                try:
+                    await ctx.bot.edit_message_text(
+                        chat_id=progress_msg.chat_id,
+                        message_id=progress_msg.message_id,
+                        text=text,
+                    )
+                except Exception:
+                    pass
+
+            hook = ProgressHook(loop, update_progress, label)
+            await ctx.bot.send_chat_action(chat_id, ChatAction.UPLOAD_VIDEO)
 
             path = None
             try:
-                path = await asyncio.get_running_loop().run_in_executor(
-                    None, download_sync, url, kind
-                )
+                path = await loop.run_in_executor(None, download_sync, url, kind, hook)
                 size_mb = path.stat().st_size / (1024 * 1024)
 
                 if size_mb > MAX_SIZE_MB:
@@ -597,43 +622,45 @@ async def download_and_send(
                     path = None
                     continue
 
+                try:
+                    await ctx.bot.edit_message_text(
+                        chat_id=progress_msg.chat_id,
+                        message_id=progress_msg.message_id,
+                        text=f"🎬 {label} 💾 {human_size(path.stat().st_size)}\n\n📤 Загружаю в Telegram…",
+                    )
+                except Exception:
+                    pass
+
                 with path.open("rb") as media:
                     if kind == "audio":
                         await ctx.bot.send_audio(
-                            chat_id=chat_id,
-                            audio=media,
-                            title=path.stem,
-                            caption="🎵 Готово!",
+                            chat_id=chat_id, audio=media,
+                            title=path.stem, caption="🎵 Готово!",
                         )
                     else:
                         await ctx.bot.send_video(
-                            chat_id=chat_id,
-                            video=media,
+                            chat_id=chat_id, video=media,
                             supports_streaming=True,
                             caption=f"🎬 Готово! ({label})",
                         )
 
                 success = True
-                if via_callback:
-                    try:
-                        await query.message.delete()
-                    except Exception:
-                        pass
-                elif status_message is not None:
-                    try:
-                        await status_message.delete()
-                    except Exception:
-                        pass
+                try:
+                    await ctx.bot.delete_message(progress_msg.chat_id, progress_msg.message_id)
+                except Exception:
+                    pass
 
-                await ctx.bot.send_message(
-                    chat_id, "Что дальше?", reply_markup=REPLY_MENU
-                )
+                await ctx.bot.send_message(chat_id, "Что дальше?", reply_markup=REPLY_MENU)
                 return
 
             except yt_dlp.utils.DownloadError as error:
                 log.warning("Формат %s недоступен: %s", kind, clean_error(error))
                 if index == len(attempts) - 1:
                     raise
+                try:
+                    await ctx.bot.delete_message(progress_msg.chat_id, progress_msg.message_id)
+                except Exception:
+                    pass
             finally:
                 cleanup_file(path)
 
@@ -654,7 +681,7 @@ async def download_and_send(
         await release_slot(success)
 
 
-# ---------- HTTP health check для Render ----------
+# ---------- HTTP health check ----------
 def start_health_server():
     port = int(os.getenv("PORT", "0"))
     if not port:
@@ -686,7 +713,6 @@ async def post_init(app: Application):
 def main():
     if not TOKEN:
         raise SystemExit("Не задана переменная BOT_TOKEN.")
-
     if os.getenv("PORT"):
         Thread(target=start_health_server, daemon=True).start()
 
@@ -702,7 +728,6 @@ def main():
         .get_updates_read_timeout(30)
         .build()
     )
-
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("help", cmd_help))
     app.add_handler(CommandHandler("status", cmd_status))
@@ -710,7 +735,7 @@ def main():
     app.add_handler(CallbackQueryHandler(on_callback, pattern=r"^(q:|sub:)"))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
 
-    log.info("Бот запускается. Прокси настроен: %s", bool(PROXY_URL))
+    log.info("Бот запускается. Прокси: %s", bool(PROXY_URL))
     app.run_polling(allowed_updates=Update.ALL_TYPES)
 
 
