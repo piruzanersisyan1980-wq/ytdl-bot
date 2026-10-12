@@ -206,6 +206,7 @@ YOUTUBE_FALLBACKS = {
     "audio": [],
 }
 
+
 # ---------- yt-dlp ----------
 def ydl_options(url: str, kind: str, output_template: str) -> dict:
     platform = platform_from_url(url)
@@ -236,9 +237,9 @@ def ydl_options(url: str, kind: str, output_template: str) -> dict:
     elif platform == "youtube":
         opts["format"] = YOUTUBE_FORMATS.get(kind, YOUTUBE_FORMATS["best"])
         opts["merge_output_format"] = "mp4"
-     else:
-        # Instagram/Facebook: сортировка по разрешению и битрейту,
-        # чтобы выбиралась максимально качественная дорожка
+    else:
+        # Instagram/Facebook: лучший видео + лучший аудио поток,
+        # сортировка сначала по разрешению, затем по битрейту
         opts["format"] = "bv*+ba/b"
         opts["format_sort"] = ["res", "br"]
         opts["merge_output_format"] = "mp4"
