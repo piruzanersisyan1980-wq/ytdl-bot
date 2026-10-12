@@ -1,715 +1,1231 @@
-# bot.py — YouTube + Instagram + Facebook Telegram bot
-import os
-import re
-import time
-import asyncio
-import logging
-import tempfile
-import shutil
-import uuid
-from pathlib import Path
-from urllib.parse import urlsplit
-from threading import Thread
-from http.server import BaseHTTPRequestHandler, HTTPServer
 
-import yt_dlp
-from telegram import (
-    Update,
-    InlineKeyboardButton,
-    InlineKeyboardMarkup,
-    ReplyKeyboardMarkup,
-    KeyboardButton,
-    BotCommand,
-)
-from telegram.constants import ChatAction
-from telegram.ext import (
-    Application,
-    CommandHandler,
-    MessageHandler,
-    CallbackQueryHandler,
-    ContextTypes,
-    filters,
-)
-
-# ---------- Настройки (значения берутся из Render Environment) ----------
-TOKEN = os.getenv("BOT_TOKEN")
-MAX_SIZE_MB = int(os.getenv("MAX_SIZE_MB", "48"))
-MAX_CONCURRENT = int(os.getenv("MAX_CONCURRENT", "2"))
-PROXY_URL = os.getenv("PROXY_URL", "").strip()
-
-CHANNEL = "@edrikevideo"
-CHANNEL_URL = "https://t.me/edrikevideo"
-
-DOWNLOAD_DIR = Path(tempfile.gettempdir()) / "ytdl_bot"
-DOWNLOAD_DIR.mkdir(parents=True, exist_ok=True)
-
-logging.basicConfig(
-    format="%(asctime)s %(levelname)s %(name)s: %(message)s",
-    level=logging.INFO,
-)
-log = logging.getLogger("ytdl-bot")
-
-# ---------- Cookies ----------
-LOCAL_COOKIES = Path(__file__).parent / "cookies.txt"
-SECRET_COOKIES = Path("/etc/secrets/cookies.txt")
-TEMP_COOKIES = Path(tempfile.gettempdir()) / "ytdl_bot_cookies.txt"
-
-COOKIES_FILE = None
-if SECRET_COOKIES.exists():
-    try:
-        shutil.copyfile(SECRET_COOKIES, TEMP_COOKIES)
-        COOKIES_FILE = TEMP_COOKIES
-    except OSError:
-        log.exception("Не удалось скопировать Secret File cookies")
-elif LOCAL_COOKIES.exists():
-    COOKIES_FILE = LOCAL_COOKIES
-
-log.info("Cookies доступны: %s", bool(COOKIES_FILE and COOKIES_FILE.exists()))
-log.info("Прокси настроен: %s", bool(PROXY_URL))
-
-# ---------- Платформы ----------
-PLATFORM_PATTERNS = [
-    ("youtube", re.compile(
-        r"https?://(?:www\.|m\.)?(?:youtube\.com|youtu\.be)/[\w\-?=&/%.]+",
-        re.IGNORECASE,
-    )),
-    ("instagram", re.compile(
-        r"https?://(?:www\.)?instagram\.com/(?:p|reel|reels|tv|share)/[\w\-?=&/%.]+",
-        re.IGNORECASE,
-    )),
-    ("facebook", re.compile(
-        r"https?://(?:(?:www|m|web|ru-ru)\.)?(?:facebook\.com|fb\.watch|fb\.com)/[\w\-?=&/%.]+",
-        re.IGNORECASE,
-    )),
-]
-
-PLATFORM_NAMES = {
-    "youtube": "▶️ YouTube",
-    "instagram": "📸 Instagram",
-    "facebook": "📘 Facebook",
-}
-
-
-def detect_platform(text: str):
-    for platform, pattern in PLATFORM_PATTERNS:
-        match = pattern.search(text)
-        if match:
-            return platform, match.group(0).rstrip(".,)")
-    return None, None
-
-
-def platform_from_url(url: str) -> str:
-    host = (urlsplit(url).hostname or "").lower()
-    if host == "youtu.be" or host == "youtube.com" or host.endswith(".youtube.com"):
-        return "youtube"
-    if host == "instagram.com" or host.endswith(".instagram.com"):
-        return "instagram"
-    if host == "facebook.com" or host.endswith(".facebook.com"):
-        return "facebook"
-    if host == "fb.watch" or host.endswith(".fb.watch"):
-        return "facebook"
-    return "other"
-
-
-# ---------- Подписка ----------
-async def check_subscription(bot, user_id: int) -> bool:
-    try:
-        member = await bot.get_chat_member(CHANNEL, user_id)
-        return member.status not in ("left", "kicked")
-    except Exception:
-        log.exception("Не удалось проверить подписку на %s", CHANNEL)
-        return False
-
-
-def subscription_keyboard() -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup([
-        [InlineKeyboardButton("📢 Подписаться на канал", url=CHANNEL_URL)],
-        [InlineKeyboardButton("✅ Я подписался", callback_data="sub:check")],
-    ])
-
-
-async def require_subscription(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> bool:
-    if await check_subscription(ctx.bot, update.effective_user.id):
-        return True
-
-    await update.effective_message.reply_text(
-        "Чтобы пользоваться ботом, подпишитесь на канал "
-        "@edrikevideo, затем нажмите «✅ Я подписался».",
-        reply_markup=subscription_keyboard(),
-    )
-    return False
-
-
-# ---------- Меню ----------
-REPLY_MENU = ReplyKeyboardMarkup(
-    [
-        [KeyboardButton("🎬 Скачать видео")],
-        [KeyboardButton("🎵 Скачать MP3"), KeyboardButton("ℹ️ Помощь")],
-        [KeyboardButton("📊 Статус"), KeyboardButton("❌ Отмена")],
-    ],
-    resize_keyboard=True,
-    input_field_placeholder="Отправьте ссылку на видео",
-)
-
-YOUTUBE_MENU = InlineKeyboardMarkup([
-    [
-        InlineKeyboardButton("🎬 1080p", callback_data="q:1080"),
-        InlineKeyboardButton("🎬 720p", callback_data="q:720"),
-    ],
-    [
-        InlineKeyboardButton("🎬 480p", callback_data="q:480"),
-        InlineKeyboardButton("🎬 360p", callback_data="q:360"),
-    ],
-    [
-        InlineKeyboardButton("⭐ Лучшее", callback_data="q:best"),
-        InlineKeyboardButton("🎵 MP3", callback_data="q:audio"),
-    ],
-    [
-        InlineKeyboardButton("⬅️ Назад", callback_data="q:back"),
-        InlineKeyboardButton("❌ Отмена", callback_data="q:cancel"),
-    ],
-])
-
-SOCIAL_MENU = InlineKeyboardMarkup([
-    [InlineKeyboardButton("🎬 Скачать видео", callback_data="q:best")],
-    [InlineKeyboardButton("🎵 MP3", callback_data="q:audio")],
-    [
-        InlineKeyboardButton("⬅️ Назад", callback_data="q:back"),
-        InlineKeyboardButton("❌ Отмена", callback_data="q:cancel"),
-    ],
-])
-
-QUALITY_LABELS = {
-    "1080": "1080p",
-    "720": "720p",
-    "480": "480p",
-    "360": "360p",
-    "best": "лучшее качество",
-    "audio": "MP3",
-}
-
-YOUTUBE_FORMATS = {
-    "1080": "bv*[height<=1080]+ba/b[height<=1080]",
-    "720": "bv*[height<=720]+ba/b[height<=720]",
-    "480": "bv*[height<=480]+ba/b[height<=480]",
-    "360": "bv*[height<=360]+ba/b[height<=360]",
-    "best": "bv*+ba/b",
-    "audio": "bestaudio/best",
-}
-
-YOUTUBE_FALLBACKS = {
-    "1080": ["720", "480", "360", "audio"],
-    "720": ["480", "360", "audio"],
-    "480": ["360", "audio"],
-    "360": ["audio"],
-    "best": ["720", "480", "360", "audio"],
-    "audio": [],
-}
-
-# ---------- yt-dlp ----------
-def ydl_options(url: str, kind: str, output_template: str) -> dict:
-    platform = platform_from_url(url)
-
-    opts = {
-        "outtmpl": output_template,
-        "noplaylist": True,
-        "quiet": True,
-        "no_warnings": True,
-        "retries": 3,
-        "socket_timeout": 60,
-    }
-
-    if COOKIES_FILE and COOKIES_FILE.exists():
-        opts["cookiefile"] = str(COOKIES_FILE)
-
-    # Прокси используется только для YouTube
-    if PROXY_URL and platform == "youtube":
-        opts["proxy"] = PROXY_URL
-
-    if kind == "audio":
-        opts["format"] = "bestaudio/best"
-        opts["postprocessors"] = [{
-            "key": "FFmpegExtractAudio",
-            "preferredcodec": "mp3",
-            "preferredquality": "192",
-        }]
-    elif platform == "youtube":
-        opts["format"] = YOUTUBE_FORMATS.get(kind, YOUTUBE_FORMATS["best"])
-        opts["merge_output_format"] = "mp4"
-    else:
-        # Instagram/Facebook обычно отдают готовую видеодорожку со звуком
-        opts["format"] = "best[ext=mp4]/best"
-        opts["merge_output_format"] = "mp4"
-
-    return opts
-
-
-def extract_info_sync(url: str) -> dict:
-    platform = platform_from_url(url)
-    opts = {
-        "skip_download": True,
-        "noplaylist": True,
-        "quiet": True,
-        "no_warnings": True,
-        "socket_timeout": 45,
-    }
-    if COOKIES_FILE and COOKIES_FILE.exists():
-        opts["cookiefile"] = str(COOKIES_FILE)
-    if PROXY_URL and platform == "youtube":
-        opts["proxy"] = PROXY_URL
-
-    with yt_dlp.YoutubeDL(opts) as ydl:
-        return ydl.extract_info(url, download=False)
-
-
-def download_sync(url: str, kind: str) -> Path:
-    job_dir = DOWNLOAD_DIR / uuid.uuid4().hex
-    job_dir.mkdir(parents=True, exist_ok=True)
-    template = str(job_dir / "%(title).100B [%(id)s].%(ext)s")
-
-    with yt_dlp.YoutubeDL(ydl_options(url, kind, template)) as ydl:
-        info = ydl.extract_info(url, download=True)
-        expected = Path(ydl.prepare_filename(info))
-
-    if kind == "audio":
-        mp3_files = list(job_dir.glob("*.mp3"))
-        if mp3_files:
-            return mp3_files[0]
-
-    if expected.exists():
-        return expected
-
-    candidates = [
-        p for p in job_dir.iterdir()
-        if p.is_file() and not p.name.endswith((".part", ".ytdl"))
-    ]
-    if candidates:
-        return max(candidates, key=lambda p: p.stat().st_size)
-
-    raise FileNotFoundError("После скачивания файл не найден")
-
-
-def cleanup_file(path):
-    if path is None:
-        return
-    try:
-        folder = path.parent
-        for item in folder.iterdir():
-            if item.is_file():
-                item.unlink(missing_ok=True)
-        folder.rmdir()
-    except OSError:
-        log.warning("Не удалось очистить временную папку %s", path.parent)
-
-
-# ---------- Форматирование и состояние ----------
-def truncate(text: str, limit: int) -> str:
-    text = (text or "").strip()
-    return text if len(text) <= limit else text[:limit - 1].rstrip() + "…"
-
-
-def format_duration(seconds) -> str:
-    if not seconds:
-        return ""
-    seconds = int(seconds)
-    hours, remainder = divmod(seconds, 3600)
-    minutes, secs = divmod(remainder, 60)
-    return f"{hours}:{minutes:02d}:{secs:02d}" if hours else f"{minutes}:{secs:02d}"
-
-
-def clean_error(error: Exception) -> str:
-    text = str(error).replace("\x1b", "")
-    return re.sub(r"\[\d+(;\d+)*m", "", text).strip()
-
-
-def format_uptime(seconds: int) -> str:
-    hours, remainder = divmod(seconds, 3600)
-    minutes, _ = divmod(remainder, 60)
-    return f"{hours}ч {minutes}м"
-
-
-semaphore = asyncio.Semaphore(MAX_CONCURRENT)
-stats_lock = asyncio.Lock()
-active_jobs = 0
-waiting_jobs = 0
-completed_jobs = 0
-started_at = time.time()
-
-
-async def acquire_slot():
-    global active_jobs, waiting_jobs
-    async with stats_lock:
-        waiting_jobs += 1
-    await semaphore.acquire()
-    async with stats_lock:
-        waiting_jobs -= 1
-        active_jobs += 1
-
-
-async def release_slot(success: bool):
-    global active_jobs, completed_jobs
-    async with stats_lock:
-        active_jobs -= 1
-        if success:
-            completed_jobs += 1
-    semaphore.release()
-
-
-async def edit_status(query, text: str):
-    try:
-        await query.edit_message_text(text)
-    except Exception:
-        try:
-            await query.edit_message_caption(caption=text)
-        except Exception:
-            await query.message.reply_text(text)
-
-
-# ---------- Команды бота ----------
-async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    if not await require_subscription(update, ctx):
-        return
-
-    cookie_status = "есть" if COOKIES_FILE and COOKIES_FILE.exists() else "нет"
-    proxy_status = "включён для YouTube" if PROXY_URL else "выключен"
-
-    await update.message.reply_text(
-        "👋 Привет! Отправьте ссылку на YouTube, Instagram или Facebook.\n"
-        "После ссылки покажу доступные варианты.\n\n"
-        f"Лимит отправки Telegram: около {MAX_SIZE_MB} МБ.\n"
-        f"Cookies: {cookie_status}.\n"
-        f"Прокси: {proxy_status}.",
-        reply_markup=REPLY_MENU,
-    )
-
-
-async def cmd_help(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    if not await require_subscription(update, ctx):
-        return
-    await update.message.reply_text(
-        "Отправьте ссылку на видео — бот покажет доступные варианты.\n"
-        "YouTube: выбор качества и MP3.\n"
-        "Instagram/Facebook: видео или MP3.\n"
-        "Большие видео бот попробует загрузить в более низком качестве.",
-        reply_markup=REPLY_MENU,
-    )
-
-
-async def cmd_status(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    if not await require_subscription(update, ctx):
-        return
-    async with stats_lock:
-        active, waiting, completed = active_jobs, waiting_jobs, completed_jobs
-
-    cookie_status = "✅ загружены" if COOKIES_FILE and COOKIES_FILE.exists() else "❌ нет"
-    proxy_status = "✅ включён для YouTube" if PROXY_URL else "❌ выключен"
-
-    await update.message.reply_text(
-        f"📊 Статус\n"
-        f"Активных задач: {active}/{MAX_CONCURRENT}\n"
-        f"В очереди: {waiting}\n"
-        f"Успешно отправлено: {completed}\n"
-        f"Cookies: {cookie_status}\n"
-        f"Прокси: {proxy_status}\n"
-        f"Аптайм: {format_uptime(int(time.time() - started_at))}",
-        reply_markup=REPLY_MENU,
-    )
-
-
-async def cmd_cancel(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    ctx.user_data.pop("url", None)
-    ctx.user_data.pop("platform", None)
-    await update.message.reply_text("Отменено.", reply_markup=REPLY_MENU)
-
-
-async def handle_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    if not await require_subscription(update, ctx):
-        return
-
-    text = (update.message.text or "").strip()
-
-    if text == "🎬 Скачать видео":
-        await update.message.reply_text("Пришлите ссылку на видео.", reply_markup=REPLY_MENU)
-        return
-    if text == "🎵 Скачать MP3":
-        await update.message.reply_text("Пришлите ссылку; затем выберите MP3.", reply_markup=REPLY_MENU)
-        return
-    if text == "ℹ️ Помощь":
-        await cmd_help(update, ctx)
-        return
-    if text == "📊 Статус":
-        await cmd_status(update, ctx)
-        return
-    if text == "❌ Отмена":
-        await cmd_cancel(update, ctx)
-        return
-
-    platform, url = detect_platform(text)
-    if not platform:
-        await update.message.reply_text(
-            "Не распознал ссылку. Поддерживаются YouTube, Instagram и Facebook.",
-            reply_markup=REPLY_MENU,
-        )
-        return
-
-    ctx.user_data["url"] = url
-    ctx.user_data["platform"] = platform
-
-    info_message = await update.message.reply_text("🔍 Получаю информацию…")
-    try:
-        info = await asyncio.get_running_loop().run_in_executor(
-            None, extract_info_sync, url
-        )
-    except Exception as error:
-        await info_message.edit_text(
-            f"❌ Не удалось получить информацию:\n{clean_error(error)}"
-        )
-        return
-
-    title = truncate(info.get("title") or "Видео", 60)
-    uploader = truncate(info.get("uploader") or info.get("channel") or "", 40)
-    duration = format_duration(info.get("duration"))
-
-    caption_lines = [f"{PLATFORM_NAMES[platform]}: {title}"]
-    if uploader:
-        caption_lines.append(f"👤 {uploader}")
-    if duration:
-        caption_lines.append(f"⏱ {duration}")
-    caption_lines.append("")
-    caption_lines.append(
-        "Выберите качество:" if platform == "youtube" else "Выберите действие:"
-    )
-    caption = "\n".join(caption_lines)
-    keyboard = YOUTUBE_MENU if platform == "youtube" else SOCIAL_MENU
-
-    await info_message.delete()
-    thumbnail = info.get("thumbnail")
-    if thumbnail:
-        try:
-            await update.message.reply_photo(
-                photo=thumbnail,
-                caption=caption,
-                reply_markup=keyboard,
-            )
-            return
-        except Exception:
-            log.exception("Не удалось отправить превью")
-
-    await update.message.reply_text(caption, reply_markup=keyboard)
-
-
-# ---------- Кнопки ----------
-async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    data = query.data or ""
-
-    if data == "sub:check":
-        if await check_subscription(ctx.bot, query.from_user.id):
-            await query.answer("Подписка подтверждена")
-            await query.message.reply_text(
-                "Спасибо! Теперь отправьте ссылку.", reply_markup=REPLY_MENU
-            )
-        else:
-            await query.answer("Сначала подпишитесь на канал.", show_alert=True)
-        return
-
-    await query.answer()
-    action = data.removeprefix("q:")
-
-    if action in ("back", "cancel"):
-        ctx.user_data.pop("url", None)
-        ctx.user_data.pop("platform", None)
-        try:
-            await query.edit_message_reply_markup(reply_markup=None)
-        except Exception:
-            pass
-        await edit_status(
-            query,
-            "⬅️ Пришлите новую ссылку." if action == "back" else "❌ Отменено.",
-        )
-        return
-
-    if not await check_subscription(ctx.bot, query.from_user.id):
-        await query.message.reply_text(
-            "Чтобы пользоваться ботом, подпишитесь на канал @edrikevideo.",
-            reply_markup=subscription_keyboard(),
-        )
-        return
-
-    url = ctx.user_data.get("url")
-    if not url:
-        await edit_status(query, "Ссылка устарела. Пришлите её ещё раз.")
-        return
-
-    await download_and_send(update, ctx, url, action, via_callback=True)
-
-
-# ---------- Скачивание, авто-понижение и отправка ----------
-async def download_and_send(
-    update: Update,
-    ctx: ContextTypes.DEFAULT_TYPE,
-    url: str,
-    requested_kind: str,
-    via_callback: bool = False,
-):
-    query = update.callback_query if via_callback else None
-    message = query.message if query else update.effective_message
-    chat_id = message.chat_id
-    platform = platform_from_url(url)
-
-    if platform == "youtube":
-        attempts = [requested_kind] + YOUTUBE_FALLBACKS.get(requested_kind, [])
-    elif requested_kind == "audio":
-        attempts = ["audio"]
-    else:
-        attempts = ["best", "audio"]
-
-    await acquire_slot()
-    success = False
-
-    try:
-        for index, kind in enumerate(attempts):
-            label = QUALITY_LABELS.get(kind, kind)
-            status = f"⏳ Загружаю {label}…"
-            if index:
-                status = f"Файл слишком большой или формат недоступен. Пробую {label}…"
-
-            status_message = None
-            if via_callback:
-                await edit_status(query, status)
-            else:
-                status_message = await message.reply_text(status)
-
-            await ctx.bot.send_chat_action(chat_id, ChatAction.UPLOAD_DOCUMENT)
-
-            path = None
-            try:
-                path = await asyncio.get_running_loop().run_in_executor(
-                    None, download_sync, url, kind
-                )
-                size_mb = path.stat().st_size / (1024 * 1024)
-
-                if size_mb > MAX_SIZE_MB:
-                    cleanup_file(path)
-                    path = None
-                    continue
-
-                with path.open("rb") as media:
-                    if kind == "audio":
-                        await ctx.bot.send_audio(
-                            chat_id=chat_id,
-                            audio=media,
-                            title=path.stem,
-                            caption="🎵 Готово!",
-                        )
-                    else:
-                        await ctx.bot.send_video(
-                            chat_id=chat_id,
-                            video=media,
-                            supports_streaming=True,
-                            caption=f"🎬 Готово! ({label})",
-                        )
-
-                success = True
-                if via_callback:
-                    try:
-                        await query.message.delete()
-                    except Exception:
-                        pass
-                elif status_message is not None:
-                    try:
-                        await status_message.delete()
-                    except Exception:
-                        pass
-
-                await ctx.bot.send_message(
-                    chat_id, "Что дальше?", reply_markup=REPLY_MENU
-                )
-                return
-
-            except yt_dlp.utils.DownloadError as error:
-                log.warning("Формат %s недоступен: %s", kind, clean_error(error))
-                if index == len(attempts) - 1:
-                    raise
-            finally:
-                cleanup_file(path)
-
-        await ctx.bot.send_message(
-            chat_id,
-            f"❌ Не удалось подобрать файл меньше {MAX_SIZE_MB} МБ.",
-            reply_markup=REPLY_MENU,
-        )
-
-    except Exception as error:
-        log.exception("Ошибка скачивания")
-        await ctx.bot.send_message(
-            chat_id,
-            f"❌ Не удалось скачать:\n{clean_error(error)}",
-            reply_markup=REPLY_MENU,
-        )
-    finally:
-        await release_slot(success)
-
-
-# ---------- HTTP health check для Render ----------
-def start_health_server():
-    port = int(os.getenv("PORT", "0"))
-    if not port:
-        return
-
-    class Handler(BaseHTTPRequestHandler):
-        def do_GET(self):
-            self.send_response(200)
-            self.send_header("Content-Type", "text/plain; charset=utf-8")
-            self.end_headers()
-            self.wfile.write(b"OK - bot is running")
-
-        def log_message(self, *_args):
-            pass
-
-    HTTPServer(("0.0.0.0", port), Handler).serve_forever()
-
-
-# ---------- Запуск ----------
-async def post_init(app: Application):
-    await app.bot.set_my_commands([
-        BotCommand("start", "Меню"),
-        BotCommand("help", "Помощь"),
-        BotCommand("status", "Статус"),
-        BotCommand("cancel", "Отмена"),
-    ])
-
-
-def main():
-    if not TOKEN:
-        raise SystemExit("Не задана переменная BOT_TOKEN.")
-
-    if os.getenv("PORT"):
-        Thread(target=start_health_server, daemon=True).start()
-
-    app = (
-        Application.builder()
-        .token(TOKEN)
-        .post_init(post_init)
-        .connect_timeout(30)
-        .read_timeout(30)
-        .write_timeout(30)
-        .pool_timeout(30)
-        .get_updates_connect_timeout(30)
-        .get_updates_read_timeout(30)
-        .build()
-    )
-
-    app.add_handler(CommandHandler("start", cmd_start))
-    app.add_handler(CommandHandler("help", cmd_help))
-    app.add_handler(CommandHandler("status", cmd_status))
-    app.add_handler(CommandHandler("cancel", cmd_cancel))
-    app.add_handler(CallbackQueryHandler(on_callback, pattern=r"^(q:|sub:)"))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
-
-    log.info("Бот запускается. Прокси настроен: %s", bool(PROXY_URL))
-    app.run_polling(allowed_updates=Update.ALL_TYPES)
-
-
-if __name__ == "__main__":
-    main()
+# Netscape HTTP Cookie File
+# https://curl.haxx.se/rfc/cookie_spec.html
+# This is a generated file! Do not edit.
+
+.web.archive.org	TRUE	/web/20240903025607/https://www.instagram.com/	TRUE	1792406528	wd	1592x776
+.web.archive.org	TRUE	/web/20240903025607/https://www.instagram.com/	TRUE	1823337734	_js_ig_did	A90C5562-47A7-49A7-A9E9-08810C84F317
+.web.archive.org	TRUE	/web/20240903025607/https://www.instagram.com/	TRUE	1826361734	_js_datr	x3rWZlYxRsUDwECCL8IoyJK8
+.web.archive.org	TRUE	/web/20240903025607/https://www.instagram.com/	TRUE	1826361734	mid	ZtZ6xwAEAAHsjVhHaJqKdiAg-HsV
+assets.msn.com	FALSE	/service/segments/recoitems	FALSE	0	_C_Auth	
+.msn.com	TRUE	/service/segments/recoitems	TRUE	0	MUID	
+.msn.com	TRUE	/service/segments/recoitems	TRUE	0	MUIDB	
+assets.msn.com	FALSE	/service/news/feed/pages	FALSE	0	_C_Auth	
+.msn.com	TRUE	/service/news/feed/pages	TRUE	0	MUID	
+.msn.com	TRUE	/service/news/feed/pages	TRUE	0	MUIDB	
+.facebook.com	TRUE	/login/device-based/	TRUE	1799577601	dbln	%7B%22100010271560418%22%3A%22VQfMlwxO%22%7D
+assets.msn.com	FALSE	/service/news/feed	FALSE	0	_C_Auth	
+.msn.com	TRUE	/service/news/feed	TRUE	0	MUID	
+.msn.com	TRUE	/service/news/feed	TRUE	0	MUIDB	
+assets.msn.com	FALSE	/service/msn	FALSE	0	_C_Auth	
+.msn.com	TRUE	/service/msn	TRUE	0	MUID	
+.msn.com	TRUE	/service/msn	TRUE	0	MUIDB	
+.yandex.ru	TRUE	/watch	TRUE	1791802217	sc_1791801617366	instagram%20%D0%B2%D0%BE%D0%B9%D1%82%D0%B8:web.archive.org:%2Fsearch%2F:1791801613628601-8748935703776976062-balancer-l7leveler-kubr-yp-nrg-139-BAL
+ntp.msn.com	FALSE	/edge	FALSE	0	_C_Auth	
+.msn.com	TRUE	/edge	FALSE	1807526413	pglt-edgeChromium-ntp	2083
+.yandex.ru	TRUE	/page	TRUE	1791805216	sq	instagram%20%D0%B2%D0%BE%D0%B9%D1%82%D0%B8
+.yandex.ru	TRUE	/meta	TRUE	1791805216	sq	instagram%20%D0%B2%D0%BE%D0%B9%D1%82%D0%B8
+.instagram.com	TRUE	/	TRUE	1826341266	csrftoken	5EbCFZObfnyovzwWL7KT4l
+.yandex.ru	TRUE	/	TRUE	1826341267	i	u7EgcwQDg89H7/8hl+pAucR2O5yPpchmX49pULgsMXJBJ/562fHjuHd6wbA0AxOCU0SYDZoDP6ew0Vtr7WdddPjdaQI=
+.yandex.ru	TRUE	/	TRUE	1823317431	yandexuid	2057550491791781264
+.dzen.ru	TRUE	/	TRUE	1826341267	zencookie	919585371791781265
+.dzen.ru	TRUE	/	TRUE	1792990869	zen_sso_checked	1
+.passport.yandex.ru	TRUE	/	TRUE	1826341436	mda2_domains	dzen.ru
+.dzen.ru	TRUE	/	TRUE	1826341436	yandexuid	2057550491791781264
+.dzen.ru	TRUE	/	TRUE	1792990869	zen_vk_sso_checked	1
+accounts.google.com	FALSE	/	TRUE	1794373288	OTZ	8824621_28_32_123600_28_436080
+.vk.com	TRUE	/	TRUE	1823317377	remixstid	1049905078_4TFjmDsgwHIHqQpHUVtaTf54AhUwoPoB3pEm8I4Dttg
+.vk.com	TRUE	/	TRUE	1823317377	remixstlid	9070217242210108484_RRJcyzzlBOh9EKP9iJMZwE2x9TJzRmS7BZ0WVvppZPc
+.dzen.ru	TRUE	/	FALSE	1820552638	tmr_lvid	4093b11a007cc3885a7d6becff55df16
+.dzen.ru	TRUE	/	FALSE	1820552638	tmr_lvidTS	1791781378906
+.dzen.ru	TRUE	/	TRUE	1823317379	_ym_uid	1791781379418807677
+.dzen.ru	TRUE	/	TRUE	1823317379	_ym_d	1791781379
+.dzen.ru	TRUE	/	FALSE	1791867838	is_auth_through_phone	true
+.dzen.ru	TRUE	/	FALSE	1791867838	is_online_stat	false
+.dzen.ru	TRUE	/	FALSE	1823317438	Zen-User-Data	{%22zen-theme%22:%22light%22%2C%22zen-theme-setting%22:%22light%22}
+.dzen.ru	TRUE	/	TRUE	1791853379	_ym_isad	2
+.dzen.ru	TRUE	/	FALSE	1822885380	stable_city	0
+.dzen.ru	TRUE	/	FALSE	1791867780	has_stable_city	true
+.dzen.ru	TRUE	/	FALSE	1826341381	zen_gid	10502
+.dzen.ru	TRUE	/	FALSE	1826341381	zen_vk_gid	2249
+.dzen.ru	TRUE	/	FALSE	1826341381	zen_extra_gid	
+.dzen.ru	TRUE	/	FALSE	1826341381	zen_extra_vk_gid	
+.dzen.ru	TRUE	/	FALSE	1791867780	front_fpid	urcfsIXwez5Iz4YsZbsbN
+.dzen.ru	TRUE	/	FALSE	1807333380	compliance-alert	true
+.dzen.ru	TRUE	/	FALSE	0	logical-device-width	1592
+.dzen.ru	TRUE	/	FALSE	0	logical-device-height	776
+.vk.com	TRUE	/	TRUE	1823519498	remixlang	0
+passport.yandex.ru	FALSE	/	TRUE	1826341394	uniqueuid	bbc0f16b57fc44b0b22e4b7ee25323441791781392
+mc.yandex.com	FALSE	/	TRUE	0	yabs-sid	511066671791781394
+.yandex.ru	TRUE	/	TRUE	1823337616	gdpr	0
+.yandex.ru	TRUE	/	TRUE	1823317399	_ym_uid	1791781396464520707
+.yandex.ru	TRUE	/	TRUE	1823317399	_ym_d	1791781399
+.yandex.com	TRUE	/	TRUE	1826341400	yandexuid	2057550491791781264
+.yandex.com	TRUE	/	TRUE	1826341400	yuidss	2057550491791781264
+.yandex.com	TRUE	/	TRUE	1826341400	i	u7EgcwQDg89H7/8hl+pAucR2O5yPpchmX49pULgsMXJBJ/562fHjuHd6wbA0AxOCU0SYDZoDP6ew0Vtr7WdddPjdaQI=
+.yandex.com	TRUE	/	TRUE	1826341400	yp	1791867797.yu.9069183861791781394
+.yandex.com	TRUE	/	TRUE	1823317397	ymex	1794373397.oyu.9069183861791781394#1823317394.yrts.1791781394#1823317394.yrtsi.1791781394
+.mc.yandex.com	TRUE	/	TRUE	1791867797	sync_cookie_ok	synced
+.yandex.com	TRUE	/	TRUE	1826341420	_yasc	DPEiGEj2q1s8Bhf+YcBRV/XncuVYGrFa6h5+uLdxqynxtIW6pC6VLL1Iakt6Qbeoij9cOhY=
+.yandex.ru	TRUE	/	TRUE	1823317424	yandex_login	pirner4444
+.yandex.ru	TRUE	/	TRUE	1826341424	Session_id	3:1791781421.5.0.1791781421520:ImBTMw:1288.1.2:1|1773749552.-1.20002.3:1791781421|3:12249694.152772.f44q9Fy542NZ58moXFHmMiEJX3U
+.yandex.ru	TRUE	/	TRUE	1826341424	sessar	1.2118107.CiDVu0bBMlZufjgJilOeiwbQawzFvcMUu2Gtk2cWr64zgQ.FRIJHXOm_9yXOjXs2vFte6fbSvqByoiNDlN96lBFOOA
+.yandex.ru	TRUE	/	TRUE	1826341424	sessionid2	3:1791781421.5.0.1791781421520:ImBTMw:1288.1.2:1|1773749552.-1.20002.3:1791781421|3:12249694.152772.fakesign0000000000000000000
+.passport.yandex.ru	TRUE	/	TRUE	1826341424	sessguard	1.1791781421.1791781421520:ImBTMw:1288..3.500:2249790.zwGmSiSv.hKOzNvmOfcPuMhE-Wzrqro1_YmA
+.yandex.ru	TRUE	/	FALSE	1826341424	L	dAdEfV90TVddVXB6RmhVAARZeVxbZ1xXQB82IxAQREJgbg==.1791781421.2241931.368472.eb63110cea5a688c723c8790a555c81b
+.passport.yandex.ru	TRUE	/	TRUE	1826341424	lah	2:1854853421.12249724.53GTX7hcA9nI_geS.MsJmB3K2YR1kqNiztO2YsuSQPr35rSv_NkX_.BUWrWhfxCnxr1oLBZOrqqw
+.passport.yandex.ru	TRUE	/	TRUE	1826341424	mda2_beacon	1791781421909
+oauth.yandex.ru	FALSE	/	TRUE	1826341432	uniqueuid	122081841791781429
+.yandex.ru	TRUE	/	TRUE	1791853433	_ym_isad	2
+mc.yandex.ru	FALSE	/	TRUE	0	yabs-sid	1875645611791781431
+.yandex.ru	TRUE	/	TRUE	1823317431	yuidss	2057550491791781264
+.yandex.ru	TRUE	/	TRUE	1823317431	ymex	1823317431.yrts.1791781431
+.dzen.ru	TRUE	/	TRUE	1823317435	zen_session_id	eq3ra9fqqciKK0pKGngJbOYf00xYTF76hAQ.1791781433130
+.sso.dzen.ru	TRUE	/	TRUE	1826341436	Session_id	3:1791781433.5.0.1791781433691:ImBTMw:2bcb.1.2:1|1773749552.-1.20002.3:1791781421|64:12249732.625073.Ki6nz-TWFJKdxwmA_XZu_ahivis
+.sso.dzen.ru	TRUE	/	TRUE	1826341436	sessar	1.2118107.CiBtVpauIdiN9UNSsfWQDSm6LAg3NXKFcAu55CkBMQpW7w.lTwJQ54lgZ2zducIKY72WkwXDv6DqYdV2VdtaJ81OP8
+.dzen.ru	TRUE	/	TRUE	1826341436	dzen_sess_id	y0__wgBELCK5c0GGI6OOiCKopGxGND1RY_vbtJl23miGLEWbYwyp9is
+.dzen.ru	TRUE	/	TRUE	1823317436	yandex_login	pirner4444
+.dzen.ru	TRUE	/	TRUE	0	ys	c_chck.1768481122#udn.cDpwaXJuZXI0NDQ0
+.sso.dzen.ru	TRUE	/	TRUE	1826341436	i	qYpAez9F/dbtU+BzvYYsZ746V+z0OwWLs3BnV4vUCSfwb9a+nPYf2kY67CRFan1NuFeGkwWbuKrdWhWbifumfszZeUE=
+.dzen.ru	TRUE	/	TRUE	1826341436	mda2_beacon	1791781434066
+.dzen.ru	TRUE	/	TRUE	1826341437	_yasc	/cQMac+ivn1ZOCHXiiRtelF3NcZLAmNXrqfFl5bAN86Da29jM+Ulahve9Hwc4G+kM31PEoaB04hisCCRnUS4O0QhRN0tZHZ95M4A4uNdN4k=
+dzen.ru	FALSE	/	FALSE	1792386239	domain_sid	urcfsIXwez5Iz4YsZbsbN%3A1791781438715
+.dzen.ru	TRUE	/	FALSE	1823317439	skip_glif_onboarding	true
+dzen.ru	FALSE	/	FALSE	1791867841	tmr_detect	0%7C1791781441443
+.youtube.com	TRUE	/	TRUE	1807333444	__Secure-BUCKET	CJEB
+.yandex.com	TRUE	/	TRUE	1826341442	bh	EkAiTWljcm9zb2Z0IEVkZ2UiO3Y9IjE1NSIsIkNocm9taXVtIjt2PSIxNTUiLCJOb3QoQTpCcmFuZCI7dj0iMjQiGgN4ODYiDTE1NS4wLjQyODMuNDUqAj8wOgdXaW5kb3dzQgYxMC4wLjBKAjY0UloiTWljcm9zb2Z0IEVkZ2UiO3Y9IjE1NS4wLjQyODMuNDUiLCJDaHJvbWl1bSI7dj0iMTU1LjAuODA1OS40MCIsIk5vdChBOkJyYW5kIjt2PSIyNC4wLjAuMCJgwtSx1gZqIdzK4f8IktihsQOfz+HqA/v68OcN6//99g+htc2HCIDBAw==
+.youtube.com	TRUE	/	TRUE	1826341454	LOGIN_INFO	AFmmF2swRQIgNuhvqTOdYnDhOOzGZ_LvuLqk0blALZSaJho4AhY5z3ECIQD1lTzB-ABFvO6KnY_fvqMANcu-ORAu2fKCiDuznvDqrg:QUQ3MjNmenRzNDhzRkdPTnJyRFg0MzJwdV9xcUJPZW0zd2JpMXYwTlpEZlk4VHNZclZJTnZ6Q1Z3aTR1ckNRVW92MFotaU5yRUR6WVZwTE5ITGFuOWFZY1FTTUNjN0hhRnFlUFQ5bFdCNlVzbXFQNUU5SS1Rb0Z0b1pkTmNDNi1BRnhoNmJJa0lFbmkwb2UzUWRjMWI2bW1sbFhBeFlsT3NB
+.youtube.com	TRUE	/	TRUE	1825909444	__Secure-YEC	CgtWV2RvcjRKbF9CUSjO1LHWBjIoCgJGUhIiEh4SHAsMDg8QERITFBUWFxgZGhscHR4fICEiIyQlJicgH2LgAgrdAjE4LllURT1jQzZhWHJDREl0RWtBWEpWUHhOYTNycHZVR3c4RmpXdF94SW4wRm9VWm5DMjVOaGt6RHh0dDZzYTdqTU92OGROOXdKMWxDcThnb2hYejRhaDZYcTVDamFZVXJVMkV3ZVhtNnd5bG1IMEZtdTVvWURMN2I1eUUzZWszODdsazV3aGd1clJHbmJmT3RGODdGeGhNOHg1VkhDWWJHSkE3QjBTOW9acWZ4VVNZci12RFpzd2czblVHWU5GbGxCMzUzTDY1NGRvX0JhNkxZVldPV0swRzN4U2Z3ZXM5YVZSRi1RdlBTQ1hsQkUzbnJCRFcwckNuVUpDTC04dlJtVVFXZ3BySGcyeW9XVHpROU1VR0VKRDVLOFJObkhFMmZXNEhBUEhoLV9JWWJ2d2VRZnRzZUlGNDRMWjMwbUlUV2tJRW96b0MtNTdGNTlRSDVOMWItZDJsTW5RRGc%3D
+.youtube.com	TRUE	/	TRUE	1825909461	__Secure-YENID	CoECCAYSswEBWybZ6B-bK3a-l19tDSAOv2_ekUPd66QNntqgySXqIK1HLKjGYJ_YmUp5n_qQ9s0DFJj_fUhoQcYFyvTnXXZS3fOGl6RkpDrEAqBUtEOLiMjH61Mm-E7XnvB7ldIdIQlUIMOFg0dPK-3DT0N0J_7I7-UZcKWmASuMKYTJmsy36ksse2TQOfernnbyUo8yrsXdc4Ovk8-w6YwDl6wRiW-ELY-JOXMIYzhvzfDWC0zAlXPrOygGMkUBsmifZdYvsswdcocJksB2-txDrfgmyhfs8RVsT9KCo15maaRftkPgOL8tB_EV_CKmXY2jNveFOdJsVCpkB9eg-W5WogM
+myaccount.google.com	FALSE	/	TRUE	1826341473	OSID	g.a000DgnEQddvaIPtBU1CIbcAhCJ1uw78MFlFru58850j_FEra8ZerjghneH4tXJUbUa8tEWyFgACgYKARQSARQSFQHGX2Miq7NygEDCVRVnrT8L1jz3GxoVAUF8yKp6Gc99BXcv-5zZXYZPUGNI0076
+myaccount.google.com	FALSE	/	TRUE	1826341473	__Secure-OSID	g.a000DgnEQddvaIPtBU1CIbcAhCJ1uw78MFlFru58850j_FEra8ZeQd6y4K9nFt5dZfauYHLkYQACgYKAWcSARQSFQHGX2MiebAI05kxlD1TNI9iVTQXRRoVAUF8yKoJEHwYUp4arPWJ1Lhcj_E30076
+myaccount.google.com	FALSE	/	TRUE	1794373474	OTZ	8824625_28_32_123600_28_436080
+.youtube.com	TRUE	/	TRUE	1826341510	PREF	tz=Asia.Novosibirsk&f4=10000
+.doubleclick.net	TRUE	/	TRUE	1825477541	IDE	AHWqTUmWdhKFLVxIKMnaUbPie6PUxkLAs05Q76nH5MOdQaHPIy9IyPAYudsK2O94RMk
+ogs.google.com	FALSE	/	TRUE	1794373655	OTZ	8824628_28_32_123600_28_436080
+.youtube.com	TRUE	/	FALSE	1823318060	SIDCC	AKEyXzWWvlieuKwbvYyqt8NWscVblAz4kkj6Jj6CPzkiyj2iMpnYTkI2Ibwcg9SS-ZR8ckXJeA
+.youtube.com	TRUE	/	TRUE	1823318060	__Secure-1PSIDCC	AKEyXzUGB9Kc8uD4GMC7QqThNRuCFVKL5Ehqo-QR5mHAJKCxZrv7rqhAA2pwtFuuTrYvdFSP
+.youtube.com	TRUE	/	TRUE	1823318060	__Secure-3PSIDCC	AKEyXzUv0yo6YieCOP3-AE2089ArkOiId--WvOsMQ3knMsqG9titG18lPg6k2Os4ZS4T1gH_
+.msn.com	TRUE	/	TRUE	1792405076	App-User	%7B%22userId%22%3A%22m-1092B68E97166CF615C9A17E96DB6DDD%22%2C%22cohorts%22%3A%5B%7B%22name%22%3A%22SuperCold%22%2C%22everSelected%22%3Afalse%2C%22reason%22%3A%22MatchedBySignal%22%7D%5D%2C%22accountType%22%3A%22NA%22%2C%22identityType%22%3A%22App%22%2C%22settings%22%3A%7B%22userSettings%22%3A%7B%22rubyRefreshDaily%22%3A%220%22%7D%7D%2C%22responseCreationDateTime%22%3A%222026-10-12T10%3A17%3A53.3003250Z%22%2C%22debugId%22%3A%22d3a54497-3de7-436a-9e52-fdc804448aa9%7C2026-10-12T10%3A17%3A53.3003275Z%7CAuth%7CNEU-CF%7Caksgen0000001q%22%7D
+ntp.msn.com	FALSE	/	FALSE	1826360276	sptmarket	ru%7C%7Cru%7Cru-ru%7Cru-ru%7Cru%7C%7Creason%3DRevIP%3Aru%7Ccf%3D8%7CRefA%3D6accb3d13b7c4f44ab9b71cb3900a390.RefC%3D2026-10-12T10%3A17%3A53Z
+.msn.com	TRUE	/	TRUE	1826360276	USRLOC	CLOC=LAT=48.5829|LON=7.7437|A=50000|TS=261012103127|SRC=I&BID=MjYxMDEyMTczMTI3X2RjMGYyNTFkOWY0YjMwNGM3ODNiM2MzNjlkM2MxOGE0YTNhYWZhMDhiYTM3MWVkNmU0ZGIzZGE3M2U4N2M2MzM=
+.msn.com	TRUE	/	TRUE	1825496278	MUID	1092B68E97166CF615C9A17E96DB6DDD
+ntp.msn.com	FALSE	/	FALSE	1825496276	MUIDB	1092B68E97166CF615C9A17E96DB6DDD
+.msn.com	TRUE	/	TRUE	0	_EDGE_S	F=1&SID=2F7C7A880555694B06E26D7804986813
+.msn.com	TRUE	/	FALSE	1825496276	_EDGE_V	1
+.ntp.msn.com	TRUE	/	FALSE	1823336276	sptmarket_restored	ru%7C%7Cru%7Cru-ru%7Cru-ru%7Cru%7C%7Creason%3DRevIP%3Aru%7Ccf%3D8%7CRefA%3D6accb3d13b7c4f44ab9b71cb3900a390.RefC%3D2026-10-12T10%3A17%3A53Z
+.scorecardresearch.com	TRUE	/	TRUE	1825496667	UID	10F6359ffb0860be84b70fb1791800274
+.bing.com	TRUE	/	TRUE	1825496277	MUID	1092B68E97166CF615C9A17E96DB6DDD
+.c.bing.com	TRUE	/	TRUE	1792405077	MR	0
+.c.bing.com	TRUE	/	TRUE	1825496277	SRM_B	1092B68E97166CF615C9A17E96DB6DDD
+.c.bing.com	TRUE	/	TRUE	1825496277	SRM_M	1092B68E97166CF615C9A17E96DB6DDD
+.c.msn.com	TRUE	/	TRUE	1825496278	SRM_M	1092B68E97166CF615C9A17E96DB6DDD
+.c.msn.com	TRUE	/	TRUE	1792405078	MR	0
+.microsoft.com	TRUE	/	TRUE	1791886783	MSCC	NR
+.google.com	TRUE	/	TRUE	1823336646	__Secure-1PSIDTS	sidts-CjEBkldj_wcsOwIPZvTqiG2YJSwb_7BsLx2KlnATDaZs0EKbcIDmJsSAoQMh9DpnpfaWEAA
+.google.com	TRUE	/	TRUE	1823336646	__Secure-3PSIDTS	sidts-CjEBkldj_wcsOwIPZvTqiG2YJSwb_7BsLx2KlnATDaZs0EKbcIDmJsSAoQMh9DpnpfaWEAA
+.yandex.ru	TRUE	/	TRUE	1826360699	pcuid_context	9633749101791800696
+.facebook.com	TRUE	/	TRUE	1826360799	datr	1rXMai042WcrHBNf3YKWXZmk
+.facebook.com	TRUE	/	TRUE	1826361577	sb	1rXMar7Lt_nL3PQLhE_hbNxY
+.facebook.com	TRUE	/	TRUE	1792406392	wd	1592x776
+.facebook.com	TRUE	/	TRUE	1792405669	locale	ru_RU
+.yandex.ru	TRUE	/	TRUE	1793010498	cycada	NH7yqIFyBZxgLhPq9LcoZ6WrsH9IvU2pP4NCnPPnpXI=
+.msn.com	TRUE	/	TRUE	1799577614	msnup	%7B%22cnex%22%3A%22no%22%7D
+.msn.com	TRUE	/	TRUE	1825496917	MUIDB	1092B68E97166CF615C9A17E96DB6DDD
+.yandex.ru	TRUE	/	TRUE	1826360922	is_gdpr	1
+.yandex.ru	TRUE	/	TRUE	1826360922	is_gdpr_b	CL7bERCNoQMYAQ==
+.yandex.ru	TRUE	/	TRUE	1826360929	_yasc	VZlq0azwAYpowpgh9T/VwYOy0DMyDYXimc/XvbHcbV4MbBKd+aYTI63ZgLS0r+AGum/Cs73NvE0/kstml2WzeHmk0UOucFpqG1yMhfWfdafdA/LklLarokA=
+.google.com	TRUE	/	TRUE	1825967996	__Secure-ENID	CqACCAIS0gEBAQxeReJGlasekdit8IwK302C982Rwg67f7vzzE6GrGbOTG5giJm5LrvJO6ySDsStWG5Q-25bMYyKuXLO7XuC2VkfjBWY1Gbt5wKueR_Fzwi3JI2BWNknVupOYu9KnFM1JzuHgAadRMFzmWArjZC27JnilMOnyII6VPQa116n44TIpo3rys-ryMWEq7HcQtM_sJJkbs7Fum43mX00VCf2Oq6GMfzNhKR_Jc4mAC4tXFIMDEdrvb97IajKYPAQ4BXzVnbScu7a8ZPT83PrCUcU34YoAjJFAX1sxKp3m2l3acjIR494AeIhWb2Z4dAPx7VKHlMh3OVuF_aRkdUVugm8_Y5MbRF2hQP0dAz4I0zg0Jn4I5LZ2jjFjZsO
+.google.com	TRUE	/	TRUE	1807592853	NID	CvcCCAESqQIBOxGDSIM9woz3ZzumcL_tlp8S5P03-kwtmkh9RPDyZX9xHsaMxyJworDKnFmm-PzBIz7KBFo7GHkYPcwv8vHYmxA_zJYeAIaCemTCuiOF7hI32Vv8BZnksp5uqyeoPd8WoOSmyLF4aNewqDJ43ofd3gKR-mbSwarg8f-m1jpSvrL6n_Z2GXy-yVv7YQgdvDtrWEtCb11__HpfoahKkML2q3LnlGlfe4yh7W4MwUd2g9VJix_0LDiPoUeklZuO_GYSPKvXsVcMbKFgBbluioPllf5AneChzhjrZQjGTsiOxtbf2X9wA3YlwFV1JcZ4kexplREiDrXrAsjjAk6SjvYCTCLKYfV-I4W5TmlelsSHVmMN5bcib0zUOD9dGqc651R5SBMfFiO3St0oATJFAdKsB89EiGR7N2jGpKGAKkKTAnY5zbb-jXbS7sqnfqyCbKJ3I0IOoMO3wWrbswKwO0Xwuk1gFqKlAd4ekW_X_InmsgYF
+.google.com	TRUE	/	FALSE	1826361569	SID	g.a000DgnEQTKq0uZW0GTrLDRKq-Q8yFpe46uHd7j16YnODEaP0GWNO8eREhUHWE4SnuW5Y3XlSQACgYKAQ8SARQSFQHGX2MiajmmeBVBa801WWBV6Aa5AxoVAUF8yKopdrsVNIk1TpRYUf_beC_30076
+.google.com	TRUE	/	TRUE	1826361569	__Secure-1PSID	g.a000DgnEQTKq0uZW0GTrLDRKq-Q8yFpe46uHd7j16YnODEaP0GWNt8Z5Z8pobCyCsSQR8IGQowACgYKAdQSARQSFQHGX2MinYKlEAbOtZa8UhNHqxMWvhoVAUF8yKqFZqdH8xomBgLx099jb7nC0076
+.google.com	TRUE	/	TRUE	1826361569	__Secure-3PSID	g.a000DgnEQTKq0uZW0GTrLDRKq-Q8yFpe46uHd7j16YnODEaP0GWNUBsst-6mTfXfiH1kj7zobQACgYKAUoSARQSFQHGX2MiroBPzmJ2mHKwghIMz0_6jhoVAUF8yKpkjSL_HlokOEBx6YOGa3p20076
+accounts.google.com	FALSE	/	TRUE	1826361569	LSID	o.chromewebstore.google.com|o.myaccount.google.com|s.FR|s.RU|s.youtube:g.a000DgnEQcEFghZs2UbdgohpjOsKjz2cSRd8COYSRecUreCak9O6ez8nyu7siARJyDQrugzGhQACgYKAcgSARQSFQHGX2Mi0XLb3ClPCXlz46HLitiYzxoVAUF8yKoSR8eKa_DIt7fn-WeDysmK0076
+accounts.google.com	FALSE	/	TRUE	1826361569	__Host-1PLSID	o.chromewebstore.google.com|o.myaccount.google.com|s.FR|s.RU|s.youtube:g.a000DgnEQcEFghZs2UbdgohpjOsKjz2cSRd8COYSRecUreCak9O6-coD7KgmfPOGl3om_VTTAwACgYKAQoSARQSFQHGX2MiKHKewJdD5iCkccOaNMZ6RRoVAUF8yKrxAeZ6IEtcyRVWNh7yrm4D0076
+accounts.google.com	FALSE	/	TRUE	1826361569	__Host-3PLSID	o.chromewebstore.google.com|o.myaccount.google.com|s.FR|s.RU|s.youtube:g.a000DgnEQcEFghZs2UbdgohpjOsKjz2cSRd8COYSRecUreCak9O6JcgCP-0v_p644BhoPoBuegACgYKAVsSARQSFQHGX2MiKCY25Pa7yGjRQCz9ThToGxoVAUF8yKphdr7quYniVmZWs4P-1UPq0076
+.google.com	TRUE	/	FALSE	1826361569	HSID	AcQKogMgZ9SN5hxrS
+.google.com	TRUE	/	TRUE	1826361569	SSID	A2tccGUAWwnVO5QYm
+.google.com	TRUE	/	FALSE	1826361569	APISID	F80c06n9I93nhGtw/AEqsAfQ_2sE46iW6E
+.google.com	TRUE	/	TRUE	1826361569	SAPISID	AkyVdxbtFe8UGEfC/AAm8DNXi3OV6JZQtl
+.google.com	TRUE	/	TRUE	1826361569	__Secure-1PAPISID	AkyVdxbtFe8UGEfC/AAm8DNXi3OV6JZQtl
+.google.com	TRUE	/	TRUE	1826361569	__Secure-3PAPISID	AkyVdxbtFe8UGEfC/AAm8DNXi3OV6JZQtl
+accounts.google.com	FALSE	/	TRUE	1826361569	ACCOUNT_CHOOSER	AFx_qI6ZvVjht_1OXeS8klzmWK5RnwuIgIC4LjS6m8uZZfR6IPSSOMacps60fdOhZ8CwrwFupG8wx61pKY6Mid0_mB7eC93fMTVPTVHfCIuAjq0mtynPUR-40blGf-S-tWDFekQqgUYuNbGYiDIcmMQu2Tk63ASV53XevUfOovkuk42pYoxfc9L9gIQXLpHK2sdKipSjr6GPSDkyeMuEvHOe7HkmfV131oVyLtcGaRz0RyHakLNt0Oo
+accounts.google.com	FALSE	/	TRUE	1826361569	__Host-GAPS	1:3YllPDGVGDW68E8bQpoZNlyTsLJm9_G5GuEj237RSWpffUh7tSZht9u4MZybBkpVCgu-E27t3D4O5xzJ4KGRlSHimJ78Iw:mOjjB2w-SLExzQn6
+accounts.google.com	FALSE	/	TRUE	1826361569	SMSV	ADHTe-CdkneiuWW_VIbXTtos4qjsoK0XVcZvAR0ckreIqtULJFSVpaH5tCREucj0t9LzfhYOGZGpEOPD9BtOq_LB8Y1Hy3r_-6tp9fQhZ5TTxvzq0IbNDp4
+.youtube.com	TRUE	/	FALSE	1826361569	SID	g.a000DgnEQTKq0uZW0GTrLDRKq-Q8yFpe46uHd7j16YnODEaP0GWNO8eREhUHWE4SnuW5Y3XlSQACgYKAQ8SARQSFQHGX2MiajmmeBVBa801WWBV6Aa5AxoVAUF8yKopdrsVNIk1TpRYUf_beC_30076
+.youtube.com	TRUE	/	TRUE	1823337569	__Secure-1PSIDTS	sidts-CjQBkldj_xSGAzcnm8kl5uPc-cW6OHYwXXblvVHs6S86_M8BmDijQaWMgJLf3bWiGPvZVQ0kEAA
+.youtube.com	TRUE	/	TRUE	1823337569	__Secure-3PSIDTS	sidts-CjQBkldj_xSGAzcnm8kl5uPc-cW6OHYwXXblvVHs6S86_M8BmDijQaWMgJLf3bWiGPvZVQ0kEAA
+.youtube.com	TRUE	/	TRUE	1826361569	__Secure-1PSID	g.a000DgnEQTKq0uZW0GTrLDRKq-Q8yFpe46uHd7j16YnODEaP0GWNt8Z5Z8pobCyCsSQR8IGQowACgYKAdQSARQSFQHGX2MinYKlEAbOtZa8UhNHqxMWvhoVAUF8yKqFZqdH8xomBgLx099jb7nC0076
+.youtube.com	TRUE	/	TRUE	1826361569	__Secure-3PSID	g.a000DgnEQTKq0uZW0GTrLDRKq-Q8yFpe46uHd7j16YnODEaP0GWNUBsst-6mTfXfiH1kj7zobQACgYKAUoSARQSFQHGX2MiroBPzmJ2mHKwghIMz0_6jhoVAUF8yKpkjSL_HlokOEBx6YOGa3p20076
+.youtube.com	TRUE	/	FALSE	1826361569	HSID	AZqZFcuLc9UMdy1hl
+.youtube.com	TRUE	/	TRUE	1826361569	SSID	AWPhVHLCcM0sTvVLD
+.youtube.com	TRUE	/	FALSE	1826361569	APISID	F80c06n9I93nhGtw/AEqsAfQ_2sE46iW6E
+.youtube.com	TRUE	/	TRUE	1826361569	SAPISID	AkyVdxbtFe8UGEfC/AAm8DNXi3OV6JZQtl
+.youtube.com	TRUE	/	TRUE	1826361569	__Secure-1PAPISID	AkyVdxbtFe8UGEfC/AAm8DNXi3OV6JZQtl
+.youtube.com	TRUE	/	TRUE	1826361569	__Secure-3PAPISID	AkyVdxbtFe8UGEfC/AAm8DNXi3OV6JZQtl
+.google.fr	TRUE	/	FALSE	1826361570	SID	g.a000DgnEQTKq0uZW0GTrLDRKq-Q8yFpe46uHd7j16YnODEaP0GWNO8eREhUHWE4SnuW5Y3XlSQACgYKAQ8SARQSFQHGX2MiajmmeBVBa801WWBV6Aa5AxoVAUF8yKopdrsVNIk1TpRYUf_beC_30076
+.google.fr	TRUE	/	TRUE	1826361570	__Secure-1PSID	g.a000DgnEQTKq0uZW0GTrLDRKq-Q8yFpe46uHd7j16YnODEaP0GWNt8Z5Z8pobCyCsSQR8IGQowACgYKAdQSARQSFQHGX2MinYKlEAbOtZa8UhNHqxMWvhoVAUF8yKqFZqdH8xomBgLx099jb7nC0076
+.google.fr	TRUE	/	TRUE	1826361570	__Secure-3PSID	g.a000DgnEQTKq0uZW0GTrLDRKq-Q8yFpe46uHd7j16YnODEaP0GWNUBsst-6mTfXfiH1kj7zobQACgYKAUoSARQSFQHGX2MiroBPzmJ2mHKwghIMz0_6jhoVAUF8yKpkjSL_HlokOEBx6YOGa3p20076
+.google.fr	TRUE	/	FALSE	1826361570	HSID	AZqZFcuLc9UMdy1hl
+.google.fr	TRUE	/	TRUE	1826361570	SSID	AWPhVHLCcM0sTvVLD
+.google.fr	TRUE	/	FALSE	1826361570	APISID	F80c06n9I93nhGtw/AEqsAfQ_2sE46iW6E
+.google.fr	TRUE	/	TRUE	1826361570	SAPISID	AkyVdxbtFe8UGEfC/AAm8DNXi3OV6JZQtl
+.google.fr	TRUE	/	TRUE	1826361570	__Secure-1PAPISID	AkyVdxbtFe8UGEfC/AAm8DNXi3OV6JZQtl
+.google.fr	TRUE	/	TRUE	1826361570	__Secure-3PAPISID	AkyVdxbtFe8UGEfC/AAm8DNXi3OV6JZQtl
+.google.fr	TRUE	/	TRUE	1807592537	NID	Cu4CCAESoAIBOxGDSNptEkhDwN4S5W_kL8nux7tdXF78abSAn4lq2QlKOzhoNgIqVlP2LtwyEGxJvfoB_Qdh9xcOV7b8ElZYcPT_849fVZBB9awuw2bsTlBGupm477TGlzPgCCIXS2eV_QiYXOAT1mRV4ZEcWsE51teMy8K-fuRHqGdDsBpYdEfZRdAmJHK0VmUhMQHXMa6jQAaHBFrHgyzig7J8q0lbaMsZZMLlXg2UmVNu4dumNT7aWZa0GpB7-6ovqArCJLRf57IC05c2aoVh0Dq1V9X8qI5NC2dvaex2G4MM6Z0YFZUIsN7wRyAXOXkKxEqcEpjQEDWu5bSX2EIeqAZzRFafM4XrpTFM6JNBkmnJ5CoIhzMvWW5wrE5GPavCq37eHC4oATJFAdKsB88kUaL11LcFl_k5hJOhMmz7zuymVch1_evkpzeXbULp1bH4uB57T2Hgi0mikf6Ha5SIq-kq2mlB4o1eCpdGSeYH
+.google.ru	TRUE	/	FALSE	1826361571	SID	g.a000DgnEQTKq0uZW0GTrLDRKq-Q8yFpe46uHd7j16YnODEaP0GWNO8eREhUHWE4SnuW5Y3XlSQACgYKAQ8SARQSFQHGX2MiajmmeBVBa801WWBV6Aa5AxoVAUF8yKopdrsVNIk1TpRYUf_beC_30076
+.google.ru	TRUE	/	TRUE	1826361571	__Secure-1PSID	g.a000DgnEQTKq0uZW0GTrLDRKq-Q8yFpe46uHd7j16YnODEaP0GWNt8Z5Z8pobCyCsSQR8IGQowACgYKAdQSARQSFQHGX2MinYKlEAbOtZa8UhNHqxMWvhoVAUF8yKqFZqdH8xomBgLx099jb7nC0076
+.google.ru	TRUE	/	TRUE	1826361571	__Secure-3PSID	g.a000DgnEQTKq0uZW0GTrLDRKq-Q8yFpe46uHd7j16YnODEaP0GWNUBsst-6mTfXfiH1kj7zobQACgYKAUoSARQSFQHGX2MiroBPzmJ2mHKwghIMz0_6jhoVAUF8yKpkjSL_HlokOEBx6YOGa3p20076
+.google.ru	TRUE	/	FALSE	1826361571	HSID	AZqZFcuLc9UMdy1hl
+.google.ru	TRUE	/	TRUE	1826361571	SSID	AWPhVHLCcM0sTvVLD
+.google.ru	TRUE	/	FALSE	1826361571	APISID	F80c06n9I93nhGtw/AEqsAfQ_2sE46iW6E
+.google.ru	TRUE	/	TRUE	1826361571	SAPISID	AkyVdxbtFe8UGEfC/AAm8DNXi3OV6JZQtl
+.google.ru	TRUE	/	TRUE	1826361571	__Secure-1PAPISID	AkyVdxbtFe8UGEfC/AAm8DNXi3OV6JZQtl
+.google.ru	TRUE	/	TRUE	1826361571	__Secure-3PAPISID	AkyVdxbtFe8UGEfC/AAm8DNXi3OV6JZQtl
+.google.ru	TRUE	/	TRUE	1807592538	NID	Cu0CCAESnwIBOxGDSHLLlFN-sxCNELjro3s1ajfXLeV9G44r1vuhFXmZjp3Uj0opVwzOJQJ4SQBcfEoXGBMxB2noZWj08YVdmT4SSJs8aZwRlUsKJU_5dfn16Rsqtw_Lp4jvztMvxwvhiliCfxYgdyEjFOryw4opOpZ9gFgw42VGWofNAiDtre9lDKhIY85NEZ4s7I8nXZ0yoJz9GGioeKx_0l-B8ocjSicln85rOnARxo1alBEP4x237MoxTK_6ixEjAY2cUTF13OxU7IBcUDwfZ5ZrtRvHpnGIcKlhyISP2-Sg58j7EuZg_L-HR52dVKZija6nK1yL5KmTOPuEQi7VY6fBYmGjTpIZozz9krELi0XR0JAtECMpFqaJca7F-nv7D5gKzygBMkUB0qwHzyxgFw1cyKKNgr997essjvkedPkP4iayQOXg2vARGgKYMI1otWUzpTv11J49EGe-M8VZAas2aTLRfpup_NBHego
+.google.com	TRUE	/	FALSE	1823337572	SIDCC	AKEyXzUkwT4Um7D1UPLL1sErw88t-gBAe2s3z6LhIdO6FrIkNZajJpXN9tTEqXdpeWu8O2pZ
+.google.com	TRUE	/	TRUE	1823337572	__Secure-1PSIDCC	AKEyXzV9d1qlmveoTewilE8CBcaElgVqJGuEQLiYwiGVSeTv33_gfPTeoch_F6S6lV2LPJybKg
+.google.com	TRUE	/	TRUE	1823337572	__Secure-3PSIDCC	AKEyXzWBpkd_zbUuG99RGo20KG_xRAhZPmY6Bxjf4fc03CX1AEanKgsFCikuwe6imCXh2McK
+.facebook.com	TRUE	/	TRUE	1823337590	c_user	100010271560418
+.facebook.com	TRUE	/	TRUE	1799577578	fr	0icG2WJ9STV17pC3z.AWdAD1RIUZuMO8lk9jrh1Z5qAa63c216EA1Pu6iuvifZQ06weTo.BqzLjn..AAA.0.0.BqzLjn.AWdSbkP4vvaGhp4g672D_sjTxWQ
+.facebook.com	TRUE	/	TRUE	1823337590	xs	18%3AIy7QRlVbLFystA%3A2%3A1791801571%3A-1%3A-1%3A%3AAcxCXD8OP9OAcNWQZnnk18EEyURVhshL4Y1zKYuzVw
+.facebook.com	TRUE	/	TRUE	0	presence	C%7B%22t3%22%3A%5B%5D%2C%22utc3%22%3A1791801593449%2C%22v%22%3A1%7D
+.c.msn.com	TRUE	/	TRUE	0	SM	C
+.c.msn.com	TRUE	/	TRUE	1791802210	ANONCHK	0
+.yandex.ru	TRUE	/	TRUE	1826361616	yp	2107141421.udn.cDpwaXJuZXI0NDQ0#2107161616.pcs.0#1792645443.dlp.1#1794373443.gph.225_124#1792386244.szm.1%3A1600x900%3A1576x776%3A15#1791822299.iapfr.1#1794479117.hdrc.0
+.yandex.ru	TRUE	/	TRUE	1826361615	bh	EkIiTWljcm9zb2Z0IEVkZ2UiO3Y9IjE1NSIsICJDaHJvbWl1bSI7dj0iMTU1IiwgIk5vdChBOkJyYW5kIjt2PSIyNCIaBSJ4ODYiIg8iMTU1LjAuNDI4My40NSIqAj8wMgIiIjoJIldpbmRvd3MiQggiMTAuMC4wIkoEIjY0IlJcIk1pY3Jvc29mdCBFZGdlIjt2PSIxNTUuMC40MjgzLjQ1IiwgIkNocm9taXVtIjt2PSIxNTUuMC44MDU5LjQwIiwgIk5vdChBOkJyYW5kIjt2PSIyNC4wLjAuMCJaAj8wYI/ystYGaiHcyuH/CJLYobEDn8/h6gP7+vDnDev//fYPobXNhwiAwQM=
+web.archive.org	FALSE	/	FALSE	0	wb-p-SERVER	wwwb-app204
+.archive.org	TRUE	/	FALSE	1823337623	donation-identifier	815838f62a2ae21a21ac6bde5b37d315
+web.archive.org	FALSE	/	FALSE	0	wb-cdx-ui-SERVER	wwwb-app205
+.yandex.ru	TRUE	/	TRUE	0	ys	udn.cDpwaXJuZXI0NDQ0#wprid.1791801613628601-8748935703776976062-balancer-l7leveler-kubr-yp-nrg-139-BAL#c_chck.1768481122
+.web.archive.org	TRUE	/web/20240903025607/https://www.instagram.com/	TRUE	1792406528	wd	1592x776
+.web.archive.org	TRUE	/web/20240903025607/https://www.instagram.com/	TRUE	1823337734	_js_ig_did	A90C5562-47A7-49A7-A9E9-08810C84F317
+.web.archive.org	TRUE	/web/20240903025607/https://www.instagram.com/	TRUE	1826361734	_js_datr	x3rWZlYxRsUDwECCL8IoyJK8
+.web.archive.org	TRUE	/web/20240903025607/https://www.instagram.com/	TRUE	1826361734	mid	ZtZ6xwAEAAHsjVhHaJqKdiAg-HsV
+assets.msn.com	FALSE	/service/segments/recoitems	FALSE	0	_C_Auth	
+.msn.com	TRUE	/service/segments/recoitems	TRUE	0	MUID	
+.msn.com	TRUE	/service/segments/recoitems	TRUE	0	MUIDB	
+assets.msn.com	FALSE	/service/news/feed/pages	FALSE	0	_C_Auth	
+.msn.com	TRUE	/service/news/feed/pages	TRUE	0	MUID	
+.msn.com	TRUE	/service/news/feed/pages	TRUE	0	MUIDB	
+.facebook.com	TRUE	/login/device-based/	TRUE	1799577601	dbln	%7B%22100010271560418%22%3A%22VQfMlwxO%22%7D
+assets.msn.com	FALSE	/service/news/feed	FALSE	0	_C_Auth	
+.msn.com	TRUE	/service/news/feed	TRUE	0	MUID	
+.msn.com	TRUE	/service/news/feed	TRUE	0	MUIDB	
+assets.msn.com	FALSE	/service/msn	FALSE	0	_C_Auth	
+.msn.com	TRUE	/service/msn	TRUE	0	MUID	
+.msn.com	TRUE	/service/msn	TRUE	0	MUIDB	
+.yandex.ru	TRUE	/watch	TRUE	1791802217	sc_1791801617366	instagram%20%D0%B2%D0%BE%D0%B9%D1%82%D0%B8:web.archive.org:%2Fsearch%2F:1791801613628601-8748935703776976062-balancer-l7leveler-kubr-yp-nrg-139-BAL
+ntp.msn.com	FALSE	/edge	FALSE	0	_C_Auth	
+.msn.com	TRUE	/edge	FALSE	1807526413	pglt-edgeChromium-ntp	2083
+.yandex.ru	TRUE	/page	TRUE	1791805216	sq	instagram%20%D0%B2%D0%BE%D0%B9%D1%82%D0%B8
+.yandex.ru	TRUE	/meta	TRUE	1791805216	sq	instagram%20%D0%B2%D0%BE%D0%B9%D1%82%D0%B8
+.instagram.com	TRUE	/	TRUE	1826341266	csrftoken	5EbCFZObfnyovzwWL7KT4l
+.yandex.ru	TRUE	/	TRUE	1826341267	pi	MKHXZKPM8FZ6Q/ekUPMzMjDjPIBITRowpsoJR/OeIaXaqs41/WpGmZiSnxLdIeMz1Lk3co02j3816OnDkYZ76NdjKmk=
+.yandex.ru	TRUE	/	TRUE	1826341267	i	u7EgcwQDg89H7/8hl+pAucR2O5yPpchmX49pULgsMXJBJ/562fHjuHd6wbA0AxOCU0SYDZoDP6ew0Vtr7WdddPjdaQI=
+.yandex.ru	TRUE	/	TRUE	1823317431	yandexuid	2057550491791781264
+.yandex.ru	TRUE	/	TRUE	1823317267	yashr	3300461681791781264
+.dzen.ru	TRUE	/	TRUE	1826341267	zencookie	919585371791781265
+.dzen.ru	TRUE	/	TRUE	1792990869	zen_sso_checked	1
+.passport.yandex.ru	TRUE	/	TRUE	1826341436	mda2_domains	dzen.ru
+.dzen.ru	TRUE	/	TRUE	1826341436	yandexuid	2057550491791781264
+.dzen.ru	TRUE	/	TRUE	1792990869	zen_vk_sso_checked	1
+accounts.google.com	FALSE	/	TRUE	1794373288	OTZ	8824621_28_32_123600_28_436080
+.vk.com	TRUE	/	TRUE	1823317377	remixstid	1049905078_4TFjmDsgwHIHqQpHUVtaTf54AhUwoPoB3pEm8I4Dttg
+.vk.com	TRUE	/	TRUE	1823317377	remixstlid	9070217242210108484_RRJcyzzlBOh9EKP9iJMZwE2x9TJzRmS7BZ0WVvppZPc
+.sso.dzen.ru	TRUE	/	TRUE	1823317379	yashr	7693476171791781376
+.yandex.ru	TRUE	/	TRUE	1826341379	pi	jolUxEOmDuxlIwInkM0wqmUoVw0w4lJ9TFQJ/XzOhSJvlQRKQgCLCLeHJKhlfiPiUlDyoCZzl0iTycqdITSMjB/kdDg=
+.yandex.ru	TRUE	/	TRUE	1823317379	yashr	7627374841791781376
+.dzen.ru	TRUE	/	FALSE	1820552638	tmr_lvid	4093b11a007cc3885a7d6becff55df16
+.dzen.ru	TRUE	/	FALSE	1820552638	tmr_lvidTS	1791781378906
+.dzen.ru	TRUE	/	TRUE	1823317379	_ym_uid	1791781379418807677
+.dzen.ru	TRUE	/	TRUE	1823317379	_ym_d	1791781379
+.dzen.ru	TRUE	/	FALSE	1791867838	is_auth_through_phone	true
+.dzen.ru	TRUE	/	FALSE	1791867838	is_online_stat	false
+.dzen.ru	TRUE	/	FALSE	1823317438	Zen-User-Data	{%22zen-theme%22:%22light%22%2C%22zen-theme-setting%22:%22light%22}
+.dzen.ru	TRUE	/	TRUE	1791853379	_ym_isad	2
+.dzen.ru	TRUE	/	FALSE	1822885380	stable_city	0
+.dzen.ru	TRUE	/	FALSE	1791867780	has_stable_city	true
+.dzen.ru	TRUE	/	FALSE	1826341381	zen_gid	10502
+.dzen.ru	TRUE	/	FALSE	1826341381	zen_vk_gid	2249
+.dzen.ru	TRUE	/	FALSE	1826341381	zen_extra_gid	
+.dzen.ru	TRUE	/	FALSE	1826341381	zen_extra_vk_gid	
+.dzen.ru	TRUE	/	FALSE	1791867780	front_fpid	urcfsIXwez5Iz4YsZbsbN
+.dzen.ru	TRUE	/	FALSE	1807333380	compliance-alert	true
+.dzen.ru	TRUE	/	FALSE	0	logical-device-width	1592
+.dzen.ru	TRUE	/	FALSE	0	logical-device-height	776
+.vk.com	TRUE	/	TRUE	1823519498	remixlang	0
+passport.yandex.ru	FALSE	/	TRUE	1826341394	uniqueuid	bbc0f16b57fc44b0b22e4b7ee25323441791781392
+mc.yandex.com	FALSE	/	TRUE	0	yabs-sid	511066671791781394
+.yandex.ru	TRUE	/	TRUE	1823337616	gdpr	0
+.yandex.ru	TRUE	/	TRUE	1823317399	_ym_uid	1791781396464520707
+.yandex.ru	TRUE	/	TRUE	1823317399	_ym_d	1791781399
+.yandex.com	TRUE	/	TRUE	1826341400	yandexuid	2057550491791781264
+.yandex.com	TRUE	/	TRUE	1826341400	yuidss	2057550491791781264
+.yandex.com	TRUE	/	TRUE	1826341400	i	u7EgcwQDg89H7/8hl+pAucR2O5yPpchmX49pULgsMXJBJ/562fHjuHd6wbA0AxOCU0SYDZoDP6ew0Vtr7WdddPjdaQI=
+.yandex.com	TRUE	/	TRUE	1826341400	yp	1791867797.yu.9069183861791781394
+.yandex.com	TRUE	/	TRUE	1823317397	ymex	1794373397.oyu.9069183861791781394#1823317394.yrts.1791781394#1823317394.yrtsi.1791781394
+.mc.yandex.com	TRUE	/	TRUE	1791867797	sync_cookie_ok	synced
+.yandex.com	TRUE	/	TRUE	1826341420	_yasc	DPEiGEj2q1s8Bhf+YcBRV/XncuVYGrFa6h5+uLdxqynxtIW6pC6VLL1Iakt6Qbeoij9cOhY=
+.yandex.ru	TRUE	/	TRUE	1823317424	yandex_login	pirner4444
+.yandex.ru	TRUE	/	TRUE	1826341424	Session_id	3:1791781421.5.0.1791781421520:ImBTMw:1288.1.2:1|1773749552.-1.20002.3:1791781421|3:12249694.152772.f44q9Fy542NZ58moXFHmMiEJX3U
+.yandex.ru	TRUE	/	TRUE	1826341424	sessar	1.2118107.CiDVu0bBMlZufjgJilOeiwbQawzFvcMUu2Gtk2cWr64zgQ.FRIJHXOm_9yXOjXs2vFte6fbSvqByoiNDlN96lBFOOA
+.yandex.ru	TRUE	/	TRUE	1826341424	sessionid2	3:1791781421.5.0.1791781421520:ImBTMw:1288.1.2:1|1773749552.-1.20002.3:1791781421|3:12249694.152772.fakesign0000000000000000000
+.passport.yandex.ru	TRUE	/	TRUE	1826341424	sessguard	1.1791781421.1791781421520:ImBTMw:1288..3.500:2249790.zwGmSiSv.hKOzNvmOfcPuMhE-Wzrqro1_YmA
+.yandex.ru	TRUE	/	FALSE	1826341424	L	dAdEfV90TVddVXB6RmhVAARZeVxbZ1xXQB82IxAQREJgbg==.1791781421.2241931.368472.eb63110cea5a688c723c8790a555c81b
+.passport.yandex.ru	TRUE	/	TRUE	1826341424	lah	2:1854853421.12249724.53GTX7hcA9nI_geS.MsJmB3K2YR1kqNiztO2YsuSQPr35rSv_NkX_.BUWrWhfxCnxr1oLBZOrqqw
+.passport.yandex.ru	TRUE	/	TRUE	1826341424	mda2_beacon	1791781421909
+oauth.yandex.ru	FALSE	/	TRUE	1826341432	uniqueuid	122081841791781429
+.yandex.ru	TRUE	/	TRUE	1791853433	_ym_isad	2
+mc.yandex.ru	FALSE	/	TRUE	0	yabs-sid	1875645611791781431
+.yandex.ru	TRUE	/	TRUE	1823317431	yuidss	2057550491791781264
+.yandex.ru	TRUE	/	TRUE	1823317431	ymex	1823317431.yrts.1791781431
+.dzen.ru	TRUE	/	TRUE	1823317435	zen_session_id	eq3ra9fqqciKK0pKGngJbOYf00xYTF76hAQ.1791781433130
+.sso.dzen.ru	TRUE	/	TRUE	1826341436	Session_id	3:1791781433.5.0.1791781433691:ImBTMw:2bcb.1.2:1|1773749552.-1.20002.3:1791781421|64:12249732.625073.Ki6nz-TWFJKdxwmA_XZu_ahivis
+.sso.dzen.ru	TRUE	/	TRUE	1826341436	sessar	1.2118107.CiBtVpauIdiN9UNSsfWQDSm6LAg3NXKFcAu55CkBMQpW7w.lTwJQ54lgZ2zducIKY72WkwXDv6DqYdV2VdtaJ81OP8
+.dzen.ru	TRUE	/	TRUE	1826341436	dzen_sess_id	y0__wgBELCK5c0GGI6OOiCKopGxGND1RY_vbtJl23miGLEWbYwyp9is
+.dzen.ru	TRUE	/	TRUE	1823317436	yandex_login	pirner4444
+.dzen.ru	TRUE	/	TRUE	0	ys	c_chck.1768481122#udn.cDpwaXJuZXI0NDQ0
+.sso.dzen.ru	TRUE	/	TRUE	1826341436	i	qYpAez9F/dbtU+BzvYYsZ746V+z0OwWLs3BnV4vUCSfwb9a+nPYf2kY67CRFan1NuFeGkwWbuKrdWhWbifumfszZeUE=
+.dzen.ru	TRUE	/	TRUE	1826341436	mda2_beacon	1791781434066
+.dzen.ru	TRUE	/	TRUE	1826341437	_yasc	/cQMac+ivn1ZOCHXiiRtelF3NcZLAmNXrqfFl5bAN86Da29jM+Ulahve9Hwc4G+kM31PEoaB04hisCCRnUS4O0QhRN0tZHZ95M4A4uNdN4k=
+dzen.ru	FALSE	/	FALSE	1792386239	domain_sid	urcfsIXwez5Iz4YsZbsbN%3A1791781438715
+.dzen.ru	TRUE	/	FALSE	1823317439	skip_glif_onboarding	true
+dzen.ru	FALSE	/	FALSE	1791867841	tmr_detect	0%7C1791781441443
+.youtube.com	TRUE	/	TRUE	1807333444	__Secure-BUCKET	CJEB
+.youtube.com	TRUE	/	TRUE	0	YSC	jRkCAZTAkwo
+.yandex.com	TRUE	/	TRUE	1826341442	bh	EkAiTWljcm9zb2Z0IEVkZ2UiO3Y9IjE1NSIsIkNocm9taXVtIjt2PSIxNTUiLCJOb3QoQTpCcmFuZCI7dj0iMjQiGgN4ODYiDTE1NS4wLjQyODMuNDUqAj8wOgdXaW5kb3dzQgYxMC4wLjBKAjY0UloiTWljcm9zb2Z0IEVkZ2UiO3Y9IjE1NS4wLjQyODMuNDUiLCJDaHJvbWl1bSI7dj0iMTU1LjAuODA1OS40MCIsIk5vdChBOkJyYW5kIjt2PSIyNC4wLjAuMCJgwtSx1gZqIdzK4f8IktihsQOfz+HqA/v68OcN6//99g+htc2HCIDBAw==
+.youtube.com	TRUE	/	TRUE	1826341454	LOGIN_INFO	AFmmF2swRQIgNuhvqTOdYnDhOOzGZ_LvuLqk0blALZSaJho4AhY5z3ECIQD1lTzB-ABFvO6KnY_fvqMANcu-ORAu2fKCiDuznvDqrg:QUQ3MjNmenRzNDhzRkdPTnJyRFg0MzJwdV9xcUJPZW0zd2JpMXYwTlpEZlk4VHNZclZJTnZ6Q1Z3aTR1ckNRVW92MFotaU5yRUR6WVZwTE5ITGFuOWFZY1FTTUNjN0hhRnFlUFQ5bFdCNlVzbXFQNUU5SS1Rb0Z0b1pkTmNDNi1BRnhoNmJJa0lFbmkwb2UzUWRjMWI2bW1sbFhBeFlsT3NB
+.youtube.com	TRUE	/	TRUE	1807333454	__Secure-ROLLOUT_TOKEN	CNrf6LDD-Pms3gEQ3byBg9qzlwMYoKuMhtqzlwM%3D
+.doubleclick.net	TRUE	/	TRUE	1807333456	APC	ATI4zw4HI4zzeGuDqKtQSGk_8YcSzDvgq4_qsZd-UxY9swEts6JMqg
+.youtube.com	TRUE	/	TRUE	1825909444	__Secure-YEC	CgtWV2RvcjRKbF9CUSjO1LHWBjIoCgJGUhIiEh4SHAsMDg8QERITFBUWFxgZGhscHR4fICEiIyQlJicgH2LgAgrdAjE4LllURT1jQzZhWHJDREl0RWtBWEpWUHhOYTNycHZVR3c4RmpXdF94SW4wRm9VWm5DMjVOaGt6RHh0dDZzYTdqTU92OGROOXdKMWxDcThnb2hYejRhaDZYcTVDamFZVXJVMkV3ZVhtNnd5bG1IMEZtdTVvWURMN2I1eUUzZWszODdsazV3aGd1clJHbmJmT3RGODdGeGhNOHg1VkhDWWJHSkE3QjBTOW9acWZ4VVNZci12RFpzd2czblVHWU5GbGxCMzUzTDY1NGRvX0JhNkxZVldPV0swRzN4U2Z3ZXM5YVZSRi1RdlBTQ1hsQkUzbnJCRFcwckNuVUpDTC04dlJtVVFXZ3BySGcyeW9XVHpROU1VR0VKRDVLOFJObkhFMmZXNEhBUEhoLV9JWWJ2d2VRZnRzZUlGNDRMWjMwbUlUV2tJRW96b0MtNTdGNTlRSDVOMWItZDJsTW5RRGc%3D
+.youtube.com	TRUE	/	TRUE	1825909457	VISITOR_PRIVACY_METADATA	CgJGUhIiEh4SHAsMDg8QERITFBUWFxgZGhscHR4fICEiIyQlJicgHw%3D%3D
+.youtube.com	TRUE	/	TRUE	1825909461	__Secure-YENID	CoECCAYSswEBWybZ6B-bK3a-l19tDSAOv2_ekUPd66QNntqgySXqIK1HLKjGYJ_YmUp5n_qQ9s0DFJj_fUhoQcYFyvTnXXZS3fOGl6RkpDrEAqBUtEOLiMjH61Mm-E7XnvB7ldIdIQlUIMOFg0dPK-3DT0N0J_7I7-UZcKWmASuMKYTJmsy36ksse2TQOfernnbyUo8yrsXdc4Ovk8-w6YwDl6wRiW-ELY-JOXMIYzhvzfDWC0zAlXPrOygGMkUBsmifZdYvsswdcocJksB2-txDrfgmyhfs8RVsT9KCo15maaRftkPgOL8tB_EV_CKmXY2jNveFOdJsVCpkB9eg-W5WogM
+myaccount.google.com	FALSE	/	TRUE	1826341473	OSID	g.a000DgnEQddvaIPtBU1CIbcAhCJ1uw78MFlFru58850j_FEra8ZerjghneH4tXJUbUa8tEWyFgACgYKARQSARQSFQHGX2Miq7NygEDCVRVnrT8L1jz3GxoVAUF8yKp6Gc99BXcv-5zZXYZPUGNI0076
+myaccount.google.com	FALSE	/	TRUE	1826341473	__Secure-OSID	g.a000DgnEQddvaIPtBU1CIbcAhCJ1uw78MFlFru58850j_FEra8ZeQd6y4K9nFt5dZfauYHLkYQACgYKAWcSARQSFQHGX2MiebAI05kxlD1TNI9iVTQXRRoVAUF8yKoJEHwYUp4arPWJ1Lhcj_E30076
+myaccount.google.com	FALSE	/	TRUE	1794373474	OTZ	8824625_28_32_123600_28_436080
+.youtube.com	TRUE	/	TRUE	1826341510	PREF	tz=Asia.Novosibirsk&f4=10000
+.doubleclick.net	TRUE	/	TRUE	1825477541	IDE	AHWqTUmWdhKFLVxIKMnaUbPie6PUxkLAs05Q76nH5MOdQaHPIy9IyPAYudsK2O94RMk
+ogs.google.com	FALSE	/	TRUE	1794373655	OTZ	8824628_28_32_123600_28_436080
+.youtube.com	TRUE	/	FALSE	1823318060	SIDCC	AKEyXzWWvlieuKwbvYyqt8NWscVblAz4kkj6Jj6CPzkiyj2iMpnYTkI2Ibwcg9SS-ZR8ckXJeA
+.youtube.com	TRUE	/	TRUE	1823318060	__Secure-1PSIDCC	AKEyXzUGB9Kc8uD4GMC7QqThNRuCFVKL5Ehqo-QR5mHAJKCxZrv7rqhAA2pwtFuuTrYvdFSP
+.youtube.com	TRUE	/	TRUE	1823318060	__Secure-3PSIDCC	AKEyXzUv0yo6YieCOP3-AE2089ArkOiId--WvOsMQ3knMsqG9titG18lPg6k2Os4ZS4T1gH_
+.msn.com	TRUE	/	TRUE	1792405076	App-User	%7B%22userId%22%3A%22m-1092B68E97166CF615C9A17E96DB6DDD%22%2C%22cohorts%22%3A%5B%7B%22name%22%3A%22SuperCold%22%2C%22everSelected%22%3Afalse%2C%22reason%22%3A%22MatchedBySignal%22%7D%5D%2C%22accountType%22%3A%22NA%22%2C%22identityType%22%3A%22App%22%2C%22settings%22%3A%7B%22userSettings%22%3A%7B%22rubyRefreshDaily%22%3A%220%22%7D%7D%2C%22responseCreationDateTime%22%3A%222026-10-12T10%3A17%3A53.3003250Z%22%2C%22debugId%22%3A%22d3a54497-3de7-436a-9e52-fdc804448aa9%7C2026-10-12T10%3A17%3A53.3003275Z%7CAuth%7CNEU-CF%7Caksgen0000001q%22%7D
+ntp.msn.com	FALSE	/	FALSE	1826360276	sptmarket	ru%7C%7Cru%7Cru-ru%7Cru-ru%7Cru%7C%7Creason%3DRevIP%3Aru%7Ccf%3D8%7CRefA%3D6accb3d13b7c4f44ab9b71cb3900a390.RefC%3D2026-10-12T10%3A17%3A53Z
+.msn.com	TRUE	/	TRUE	1826360276	USRLOC	CLOC=LAT=48.5829|LON=7.7437|A=50000|TS=261012103127|SRC=I&BID=MjYxMDEyMTczMTI3X2RjMGYyNTFkOWY0YjMwNGM3ODNiM2MzNjlkM2MxOGE0YTNhYWZhMDhiYTM3MWVkNmU0ZGIzZGE3M2U4N2M2MzM=
+.msn.com	TRUE	/	TRUE	1825496278	MUID	1092B68E97166CF615C9A17E96DB6DDD
+ntp.msn.com	FALSE	/	FALSE	1825496276	MUIDB	1092B68E97166CF615C9A17E96DB6DDD
+.msn.com	TRUE	/	TRUE	0	_EDGE_S	F=1&SID=2F7C7A880555694B06E26D7804986813
+.msn.com	TRUE	/	FALSE	1825496276	_EDGE_V	1
+.ntp.msn.com	TRUE	/	FALSE	1823336276	sptmarket_restored	ru%7C%7Cru%7Cru-ru%7Cru-ru%7Cru%7C%7Creason%3DRevIP%3Aru%7Ccf%3D8%7CRefA%3D6accb3d13b7c4f44ab9b71cb3900a390.RefC%3D2026-10-12T10%3A17%3A53Z
+.scorecardresearch.com	TRUE	/	TRUE	1825496667	UID	10F6359ffb0860be84b70fb1791800274
+.scorecardresearch.com	TRUE	/	TRUE	1825496667	XID	10F6359ffb0860be84b70fb1791800274
+.bing.com	TRUE	/	TRUE	1825496277	MUID	1092B68E97166CF615C9A17E96DB6DDD
+.c.bing.com	TRUE	/	TRUE	1792405077	MR	0
+.c.bing.com	TRUE	/	TRUE	1825496277	SRM_B	1092B68E97166CF615C9A17E96DB6DDD
+.c.bing.com	TRUE	/	TRUE	1825496277	SRM_M	1092B68E97166CF615C9A17E96DB6DDD
+.c.msn.com	TRUE	/	TRUE	1825496278	SRM_M	1092B68E97166CF615C9A17E96DB6DDD
+.c.msn.com	TRUE	/	TRUE	1792405078	MR	0
+.microsoft.com	TRUE	/	TRUE	1791886783	MSCC	NR
+.google.com	TRUE	/	TRUE	1823336646	__Secure-1PSIDTS	sidts-CjEBkldj_wcsOwIPZvTqiG2YJSwb_7BsLx2KlnATDaZs0EKbcIDmJsSAoQMh9DpnpfaWEAA
+.google.com	TRUE	/	TRUE	1823336646	__Secure-3PSIDTS	sidts-CjEBkldj_wcsOwIPZvTqiG2YJSwb_7BsLx2KlnATDaZs0EKbcIDmJsSAoQMh9DpnpfaWEAA
+.yandex.ru	TRUE	/	TRUE	1826360699	pcuid_context	9633749101791800696
+.facebook.com	TRUE	/	TRUE	1826360799	datr	1rXMai042WcrHBNf3YKWXZmk
+.facebook.com	TRUE	/	TRUE	1826361577	sb	1rXMar7Lt_nL3PQLhE_hbNxY
+.facebook.com	TRUE	/	TRUE	1792406392	wd	1592x776
+.facebook.com	TRUE	/	TRUE	1792405669	locale	ru_RU
+.yandex.ru	TRUE	/	TRUE	1793010498	cycada	NH7yqIFyBZxgLhPq9LcoZ6WrsH9IvU2pP4NCnPPnpXI=
+.msn.com	TRUE	/	TRUE	1799577614	msnup	%7B%22cnex%22%3A%22no%22%7D
+.msn.com	TRUE	/	TRUE	1825496917	MUIDB	1092B68E97166CF615C9A17E96DB6DDD
+.yandex.ru	TRUE	/	TRUE	1826360922	is_gdpr	1
+.yandex.ru	TRUE	/	TRUE	1826360922	is_gdpr_b	CL7bERCNoQMYAQ==
+.yandex.ru	TRUE	/	TRUE	1826360929	_yasc	VZlq0azwAYpowpgh9T/VwYOy0DMyDYXimc/XvbHcbV4MbBKd+aYTI63ZgLS0r+AGum/Cs73NvE0/kstml2WzeHmk0UOucFpqG1yMhfWfdafdA/LklLarokA=
+.google.com	TRUE	/	TRUE	1825967996	__Secure-ENID	CqACCAIS0gEBAQxeReJGlasekdit8IwK302C982Rwg67f7vzzE6GrGbOTG5giJm5LrvJO6ySDsStWG5Q-25bMYyKuXLO7XuC2VkfjBWY1Gbt5wKueR_Fzwi3JI2BWNknVupOYu9KnFM1JzuHgAadRMFzmWArjZC27JnilMOnyII6VPQa116n44TIpo3rys-ryMWEq7HcQtM_sJJkbs7Fum43mX00VCf2Oq6GMfzNhKR_Jc4mAC4tXFIMDEdrvb97IajKYPAQ4BXzVnbScu7a8ZPT83PrCUcU34YoAjJFAX1sxKp3m2l3acjIR494AeIhWb2Z4dAPx7VKHlMh3OVuF_aRkdUVugm8_Y5MbRF2hQP0dAz4I0zg0Jn4I5LZ2jjFjZsO
+.google.com	TRUE	/	TRUE	1807592853	NID	CvcCCAESqQIBOxGDSIM9woz3ZzumcL_tlp8S5P03-kwtmkh9RPDyZX9xHsaMxyJworDKnFmm-PzBIz7KBFo7GHkYPcwv8vHYmxA_zJYeAIaCemTCuiOF7hI32Vv8BZnksp5uqyeoPd8WoOSmyLF4aNewqDJ43ofd3gKR-mbSwarg8f-m1jpSvrL6n_Z2GXy-yVv7YQgdvDtrWEtCb11__HpfoahKkML2q3LnlGlfe4yh7W4MwUd2g9VJix_0LDiPoUeklZuO_GYSPKvXsVcMbKFgBbluioPllf5AneChzhjrZQjGTsiOxtbf2X9wA3YlwFV1JcZ4kexplREiDrXrAsjjAk6SjvYCTCLKYfV-I4W5TmlelsSHVmMN5bcib0zUOD9dGqc651R5SBMfFiO3St0oATJFAdKsB89EiGR7N2jGpKGAKkKTAnY5zbb-jXbS7sqnfqyCbKJ3I0IOoMO3wWrbswKwO0Xwuk1gFqKlAd4ekW_X_InmsgYF
+.google.com	TRUE	/	FALSE	1826361569	SID	g.a000DgnEQTKq0uZW0GTrLDRKq-Q8yFpe46uHd7j16YnODEaP0GWNO8eREhUHWE4SnuW5Y3XlSQACgYKAQ8SARQSFQHGX2MiajmmeBVBa801WWBV6Aa5AxoVAUF8yKopdrsVNIk1TpRYUf_beC_30076
+.google.com	TRUE	/	TRUE	1826361569	__Secure-1PSID	g.a000DgnEQTKq0uZW0GTrLDRKq-Q8yFpe46uHd7j16YnODEaP0GWNt8Z5Z8pobCyCsSQR8IGQowACgYKAdQSARQSFQHGX2MinYKlEAbOtZa8UhNHqxMWvhoVAUF8yKqFZqdH8xomBgLx099jb7nC0076
+.google.com	TRUE	/	TRUE	1826361569	__Secure-3PSID	g.a000DgnEQTKq0uZW0GTrLDRKq-Q8yFpe46uHd7j16YnODEaP0GWNUBsst-6mTfXfiH1kj7zobQACgYKAUoSARQSFQHGX2MiroBPzmJ2mHKwghIMz0_6jhoVAUF8yKpkjSL_HlokOEBx6YOGa3p20076
+accounts.google.com	FALSE	/	TRUE	1826361569	LSID	o.chromewebstore.google.com|o.myaccount.google.com|s.FR|s.RU|s.youtube:g.a000DgnEQcEFghZs2UbdgohpjOsKjz2cSRd8COYSRecUreCak9O6ez8nyu7siARJyDQrugzGhQACgYKAcgSARQSFQHGX2Mi0XLb3ClPCXlz46HLitiYzxoVAUF8yKoSR8eKa_DIt7fn-WeDysmK0076
+accounts.google.com	FALSE	/	TRUE	1826361569	__Host-1PLSID	o.chromewebstore.google.com|o.myaccount.google.com|s.FR|s.RU|s.youtube:g.a000DgnEQcEFghZs2UbdgohpjOsKjz2cSRd8COYSRecUreCak9O6-coD7KgmfPOGl3om_VTTAwACgYKAQoSARQSFQHGX2MiKHKewJdD5iCkccOaNMZ6RRoVAUF8yKrxAeZ6IEtcyRVWNh7yrm4D0076
+accounts.google.com	FALSE	/	TRUE	1826361569	__Host-3PLSID	o.chromewebstore.google.com|o.myaccount.google.com|s.FR|s.RU|s.youtube:g.a000DgnEQcEFghZs2UbdgohpjOsKjz2cSRd8COYSRecUreCak9O6JcgCP-0v_p644BhoPoBuegACgYKAVsSARQSFQHGX2MiKCY25Pa7yGjRQCz9ThToGxoVAUF8yKphdr7quYniVmZWs4P-1UPq0076
+.google.com	TRUE	/	FALSE	1826361569	HSID	AcQKogMgZ9SN5hxrS
+.google.com	TRUE	/	TRUE	1826361569	SSID	A2tccGUAWwnVO5QYm
+.google.com	TRUE	/	FALSE	1826361569	APISID	F80c06n9I93nhGtw/AEqsAfQ_2sE46iW6E
+.google.com	TRUE	/	TRUE	1826361569	SAPISID	AkyVdxbtFe8UGEfC/AAm8DNXi3OV6JZQtl
+.google.com	TRUE	/	TRUE	1826361569	__Secure-1PAPISID	AkyVdxbtFe8UGEfC/AAm8DNXi3OV6JZQtl
+.google.com	TRUE	/	TRUE	1826361569	__Secure-3PAPISID	AkyVdxbtFe8UGEfC/AAm8DNXi3OV6JZQtl
+accounts.google.com	FALSE	/	TRUE	1826361569	ACCOUNT_CHOOSER	AFx_qI6ZvVjht_1OXeS8klzmWK5RnwuIgIC4LjS6m8uZZfR6IPSSOMacps60fdOhZ8CwrwFupG8wx61pKY6Mid0_mB7eC93fMTVPTVHfCIuAjq0mtynPUR-40blGf-S-tWDFekQqgUYuNbGYiDIcmMQu2Tk63ASV53XevUfOovkuk42pYoxfc9L9gIQXLpHK2sdKipSjr6GPSDkyeMuEvHOe7HkmfV131oVyLtcGaRz0RyHakLNt0Oo
+accounts.google.com	FALSE	/	TRUE	1826361569	__Host-GAPS	1:3YllPDGVGDW68E8bQpoZNlyTsLJm9_G5GuEj237RSWpffUh7tSZht9u4MZybBkpVCgu-E27t3D4O5xzJ4KGRlSHimJ78Iw:mOjjB2w-SLExzQn6
+accounts.google.com	FALSE	/	TRUE	1826361569	SMSV	ADHTe-CdkneiuWW_VIbXTtos4qjsoK0XVcZvAR0ckreIqtULJFSVpaH5tCREucj0t9LzfhYOGZGpEOPD9BtOq_LB8Y1Hy3r_-6tp9fQhZ5TTxvzq0IbNDp4
+.youtube.com	TRUE	/	FALSE	1826361569	SID	g.a000DgnEQTKq0uZW0GTrLDRKq-Q8yFpe46uHd7j16YnODEaP0GWNO8eREhUHWE4SnuW5Y3XlSQACgYKAQ8SARQSFQHGX2MiajmmeBVBa801WWBV6Aa5AxoVAUF8yKopdrsVNIk1TpRYUf_beC_30076
+.youtube.com	TRUE	/	TRUE	1823337569	__Secure-1PSIDTS	sidts-CjQBkldj_xSGAzcnm8kl5uPc-cW6OHYwXXblvVHs6S86_M8BmDijQaWMgJLf3bWiGPvZVQ0kEAA
+.youtube.com	TRUE	/	TRUE	1823337569	__Secure-3PSIDTS	sidts-CjQBkldj_xSGAzcnm8kl5uPc-cW6OHYwXXblvVHs6S86_M8BmDijQaWMgJLf3bWiGPvZVQ0kEAA
+.youtube.com	TRUE	/	TRUE	1826361569	__Secure-1PSID	g.a000DgnEQTKq0uZW0GTrLDRKq-Q8yFpe46uHd7j16YnODEaP0GWNt8Z5Z8pobCyCsSQR8IGQowACgYKAdQSARQSFQHGX2MinYKlEAbOtZa8UhNHqxMWvhoVAUF8yKqFZqdH8xomBgLx099jb7nC0076
+.youtube.com	TRUE	/	TRUE	1826361569	__Secure-3PSID	g.a000DgnEQTKq0uZW0GTrLDRKq-Q8yFpe46uHd7j16YnODEaP0GWNUBsst-6mTfXfiH1kj7zobQACgYKAUoSARQSFQHGX2MiroBPzmJ2mHKwghIMz0_6jhoVAUF8yKpkjSL_HlokOEBx6YOGa3p20076
+.youtube.com	TRUE	/	FALSE	1826361569	HSID	AZqZFcuLc9UMdy1hl
+.youtube.com	TRUE	/	TRUE	1826361569	SSID	AWPhVHLCcM0sTvVLD
+.youtube.com	TRUE	/	FALSE	1826361569	APISID	F80c06n9I93nhGtw/AEqsAfQ_2sE46iW6E
+.youtube.com	TRUE	/	TRUE	1826361569	SAPISID	AkyVdxbtFe8UGEfC/AAm8DNXi3OV6JZQtl
+.youtube.com	TRUE	/	TRUE	1826361569	__Secure-1PAPISID	AkyVdxbtFe8UGEfC/AAm8DNXi3OV6JZQtl
+.youtube.com	TRUE	/	TRUE	1826361569	__Secure-3PAPISID	AkyVdxbtFe8UGEfC/AAm8DNXi3OV6JZQtl
+.google.fr	TRUE	/	FALSE	1826361570	SID	g.a000DgnEQTKq0uZW0GTrLDRKq-Q8yFpe46uHd7j16YnODEaP0GWNO8eREhUHWE4SnuW5Y3XlSQACgYKAQ8SARQSFQHGX2MiajmmeBVBa801WWBV6Aa5AxoVAUF8yKopdrsVNIk1TpRYUf_beC_30076
+.google.fr	TRUE	/	TRUE	1826361570	__Secure-1PSID	g.a000DgnEQTKq0uZW0GTrLDRKq-Q8yFpe46uHd7j16YnODEaP0GWNt8Z5Z8pobCyCsSQR8IGQowACgYKAdQSARQSFQHGX2MinYKlEAbOtZa8UhNHqxMWvhoVAUF8yKqFZqdH8xomBgLx099jb7nC0076
+.google.fr	TRUE	/	TRUE	1826361570	__Secure-3PSID	g.a000DgnEQTKq0uZW0GTrLDRKq-Q8yFpe46uHd7j16YnODEaP0GWNUBsst-6mTfXfiH1kj7zobQACgYKAUoSARQSFQHGX2MiroBPzmJ2mHKwghIMz0_6jhoVAUF8yKpkjSL_HlokOEBx6YOGa3p20076
+.google.fr	TRUE	/	FALSE	1826361570	HSID	AZqZFcuLc9UMdy1hl
+.google.fr	TRUE	/	TRUE	1826361570	SSID	AWPhVHLCcM0sTvVLD
+.google.fr	TRUE	/	FALSE	1826361570	APISID	F80c06n9I93nhGtw/AEqsAfQ_2sE46iW6E
+.google.fr	TRUE	/	TRUE	1826361570	SAPISID	AkyVdxbtFe8UGEfC/AAm8DNXi3OV6JZQtl
+.google.fr	TRUE	/	TRUE	1826361570	__Secure-1PAPISID	AkyVdxbtFe8UGEfC/AAm8DNXi3OV6JZQtl
+.google.fr	TRUE	/	TRUE	1826361570	__Secure-3PAPISID	AkyVdxbtFe8UGEfC/AAm8DNXi3OV6JZQtl
+.google.fr	TRUE	/	TRUE	1807592537	NID	Cu4CCAESoAIBOxGDSNptEkhDwN4S5W_kL8nux7tdXF78abSAn4lq2QlKOzhoNgIqVlP2LtwyEGxJvfoB_Qdh9xcOV7b8ElZYcPT_849fVZBB9awuw2bsTlBGupm477TGlzPgCCIXS2eV_QiYXOAT1mRV4ZEcWsE51teMy8K-fuRHqGdDsBpYdEfZRdAmJHK0VmUhMQHXMa6jQAaHBFrHgyzig7J8q0lbaMsZZMLlXg2UmVNu4dumNT7aWZa0GpB7-6ovqArCJLRf57IC05c2aoVh0Dq1V9X8qI5NC2dvaex2G4MM6Z0YFZUIsN7wRyAXOXkKxEqcEpjQEDWu5bSX2EIeqAZzRFafM4XrpTFM6JNBkmnJ5CoIhzMvWW5wrE5GPavCq37eHC4oATJFAdKsB88kUaL11LcFl_k5hJOhMmz7zuymVch1_evkpzeXbULp1bH4uB57T2Hgi0mikf6Ha5SIq-kq2mlB4o1eCpdGSeYH
+.google.ru	TRUE	/	FALSE	1826361571	SID	g.a000DgnEQTKq0uZW0GTrLDRKq-Q8yFpe46uHd7j16YnODEaP0GWNO8eREhUHWE4SnuW5Y3XlSQACgYKAQ8SARQSFQHGX2MiajmmeBVBa801WWBV6Aa5AxoVAUF8yKopdrsVNIk1TpRYUf_beC_30076
+.google.ru	TRUE	/	TRUE	1826361571	__Secure-1PSID	g.a000DgnEQTKq0uZW0GTrLDRKq-Q8yFpe46uHd7j16YnODEaP0GWNt8Z5Z8pobCyCsSQR8IGQowACgYKAdQSARQSFQHGX2MinYKlEAbOtZa8UhNHqxMWvhoVAUF8yKqFZqdH8xomBgLx099jb7nC0076
+.google.ru	TRUE	/	TRUE	1826361571	__Secure-3PSID	g.a000DgnEQTKq0uZW0GTrLDRKq-Q8yFpe46uHd7j16YnODEaP0GWNUBsst-6mTfXfiH1kj7zobQACgYKAUoSARQSFQHGX2MiroBPzmJ2mHKwghIMz0_6jhoVAUF8yKpkjSL_HlokOEBx6YOGa3p20076
+.google.ru	TRUE	/	FALSE	1826361571	HSID	AZqZFcuLc9UMdy1hl
+.google.ru	TRUE	/	TRUE	1826361571	SSID	AWPhVHLCcM0sTvVLD
+.google.ru	TRUE	/	FALSE	1826361571	APISID	F80c06n9I93nhGtw/AEqsAfQ_2sE46iW6E
+.google.ru	TRUE	/	TRUE	1826361571	SAPISID	AkyVdxbtFe8UGEfC/AAm8DNXi3OV6JZQtl
+.google.ru	TRUE	/	TRUE	1826361571	__Secure-1PAPISID	AkyVdxbtFe8UGEfC/AAm8DNXi3OV6JZQtl
+.google.ru	TRUE	/	TRUE	1826361571	__Secure-3PAPISID	AkyVdxbtFe8UGEfC/AAm8DNXi3OV6JZQtl
+.google.ru	TRUE	/	TRUE	1807592538	NID	Cu0CCAESnwIBOxGDSHLLlFN-sxCNELjro3s1ajfXLeV9G44r1vuhFXmZjp3Uj0opVwzOJQJ4SQBcfEoXGBMxB2noZWj08YVdmT4SSJs8aZwRlUsKJU_5dfn16Rsqtw_Lp4jvztMvxwvhiliCfxYgdyEjFOryw4opOpZ9gFgw42VGWofNAiDtre9lDKhIY85NEZ4s7I8nXZ0yoJz9GGioeKx_0l-B8ocjSicln85rOnARxo1alBEP4x237MoxTK_6ixEjAY2cUTF13OxU7IBcUDwfZ5ZrtRvHpnGIcKlhyISP2-Sg58j7EuZg_L-HR52dVKZija6nK1yL5KmTOPuEQi7VY6fBYmGjTpIZozz9krELi0XR0JAtECMpFqaJca7F-nv7D5gKzygBMkUB0qwHzyxgFw1cyKKNgr997essjvkedPkP4iayQOXg2vARGgKYMI1otWUzpTv11J49EGe-M8VZAas2aTLRfpup_NBHego
+.google.com	TRUE	/	FALSE	1823337572	SIDCC	AKEyXzUkwT4Um7D1UPLL1sErw88t-gBAe2s3z6LhIdO6FrIkNZajJpXN9tTEqXdpeWu8O2pZ
+.google.com	TRUE	/	TRUE	1823337572	__Secure-1PSIDCC	AKEyXzV9d1qlmveoTewilE8CBcaElgVqJGuEQLiYwiGVSeTv33_gfPTeoch_F6S6lV2LPJybKg
+.google.com	TRUE	/	TRUE	1823337572	__Secure-3PSIDCC	AKEyXzWBpkd_zbUuG99RGo20KG_xRAhZPmY6Bxjf4fc03CX1AEanKgsFCikuwe6imCXh2McK
+.facebook.com	TRUE	/	TRUE	1823337590	c_user	100010271560418
+.facebook.com	TRUE	/	TRUE	1799577578	fr	0icG2WJ9STV17pC3z.AWdAD1RIUZuMO8lk9jrh1Z5qAa63c216EA1Pu6iuvifZQ06weTo.BqzLjn..AAA.0.0.BqzLjn.AWdSbkP4vvaGhp4g672D_sjTxWQ
+.facebook.com	TRUE	/	TRUE	1823337590	xs	18%3AIy7QRlVbLFystA%3A2%3A1791801571%3A-1%3A-1%3A%3AAcxCXD8OP9OAcNWQZnnk18EEyURVhshL4Y1zKYuzVw
+.facebook.com	TRUE	/	TRUE	0	presence	C%7B%22t3%22%3A%5B%5D%2C%22utc3%22%3A1791801593449%2C%22v%22%3A1%7D
+.c.msn.com	TRUE	/	TRUE	0	SM	C
+.c.msn.com	TRUE	/	TRUE	1791802210	ANONCHK	0
+.yandex.ru	TRUE	/	TRUE	1826361616	yp	2107141421.udn.cDpwaXJuZXI0NDQ0#2107161616.pcs.0#1792645443.dlp.1#1794373443.gph.225_124#1792386244.szm.1%3A1600x900%3A1576x776%3A15#1791822299.iapfr.1#1794479117.hdrc.0
+.yandex.ru	TRUE	/	TRUE	1826361615	bh	EkIiTWljcm9zb2Z0IEVkZ2UiO3Y9IjE1NSIsICJDaHJvbWl1bSI7dj0iMTU1IiwgIk5vdChBOkJyYW5kIjt2PSIyNCIaBSJ4ODYiIg8iMTU1LjAuNDI4My40NSIqAj8wMgIiIjoJIldpbmRvd3MiQggiMTAuMC4wIkoEIjY0IlJcIk1pY3Jvc29mdCBFZGdlIjt2PSIxNTUuMC40MjgzLjQ1IiwgIkNocm9taXVtIjt2PSIxNTUuMC44MDU5LjQwIiwgIk5vdChBOkJyYW5kIjt2PSIyNC4wLjAuMCJaAj8wYI/ystYGaiHcyuH/CJLYobEDn8/h6gP7+vDnDev//fYPobXNhwiAwQM=
+web.archive.org	FALSE	/	FALSE	0	wb-p-SERVER	wwwb-app204
+.archive.org	TRUE	/	FALSE	1823337623	donation-identifier	815838f62a2ae21a21ac6bde5b37d315
+web.archive.org	FALSE	/	FALSE	0	wb-cdx-ui-SERVER	wwwb-app205
+.yandex.ru	TRUE	/	TRUE	0	ys	udn.cDpwaXJuZXI0NDQ0#wprid.1791801613628601-8748935703776976062-balancer-l7leveler-kubr-yp-nrg-139-BAL#c_chck.1768481122
+# Netscape HTTP Cookie File
+# https://curl.haxx.se/rfc/cookie_spec.html
+# This is a generated file! Do not edit.
+
+.web.archive.org	TRUE	/web/20240903025607/https://www.instagram.com/	TRUE	1792406528	wd	1592x776
+.web.archive.org	TRUE	/web/20240903025607/https://www.instagram.com/	TRUE	1823337734	_js_ig_did	A90C5562-47A7-49A7-A9E9-08810C84F317
+.web.archive.org	TRUE	/web/20240903025607/https://www.instagram.com/	TRUE	1826361734	_js_datr	x3rWZlYxRsUDwECCL8IoyJK8
+.web.archive.org	TRUE	/web/20240903025607/https://www.instagram.com/	TRUE	1826361734	mid	ZtZ6xwAEAAHsjVhHaJqKdiAg-HsV
+assets.msn.com	FALSE	/service/segments/recoitems	FALSE	0	_C_Auth	
+.msn.com	TRUE	/service/segments/recoitems	TRUE	0	MUID	
+.msn.com	TRUE	/service/segments/recoitems	TRUE	0	MUIDB	
+assets.msn.com	FALSE	/service/news/feed/pages	FALSE	0	_C_Auth	
+.msn.com	TRUE	/service/news/feed/pages	TRUE	0	MUID	
+.msn.com	TRUE	/service/news/feed/pages	TRUE	0	MUIDB	
+.facebook.com	TRUE	/login/device-based/	TRUE	1799577601	dbln	%7B%22100010271560418%22%3A%22VQfMlwxO%22%7D
+assets.msn.com	FALSE	/service/news/feed	FALSE	0	_C_Auth	
+.msn.com	TRUE	/service/news/feed	TRUE	0	MUID	
+.msn.com	TRUE	/service/news/feed	TRUE	0	MUIDB	
+assets.msn.com	FALSE	/service/msn	FALSE	0	_C_Auth	
+.msn.com	TRUE	/service/msn	TRUE	0	MUID	
+.msn.com	TRUE	/service/msn	TRUE	0	MUIDB	
+ntp.msn.com	FALSE	/edge	FALSE	0	_C_Auth	
+.msn.com	TRUE	/edge	FALSE	1807526413	pglt-edgeChromium-ntp	2083
+.yandex.ru	TRUE	/page	TRUE	1791805216	sq	instagram%20%D0%B2%D0%BE%D0%B9%D1%82%D0%B8
+.yandex.ru	TRUE	/meta	TRUE	1791805216	sq	instagram%20%D0%B2%D0%BE%D0%B9%D1%82%D0%B8
+.instagram.com	TRUE	/	TRUE	1826341266	csrftoken	5EbCFZObfnyovzwWL7KT4l
+.yandex.ru	TRUE	/	TRUE	1826341267	i	u7EgcwQDg89H7/8hl+pAucR2O5yPpchmX49pULgsMXJBJ/562fHjuHd6wbA0AxOCU0SYDZoDP6ew0Vtr7WdddPjdaQI=
+.yandex.ru	TRUE	/	TRUE	1823317431	yandexuid	2057550491791781264
+.dzen.ru	TRUE	/	TRUE	1826341267	zencookie	919585371791781265
+.dzen.ru	TRUE	/	TRUE	1792990869	zen_sso_checked	1
+.passport.yandex.ru	TRUE	/	TRUE	1826341436	mda2_domains	dzen.ru
+.dzen.ru	TRUE	/	TRUE	1826341436	yandexuid	2057550491791781264
+.dzen.ru	TRUE	/	TRUE	1792990869	zen_vk_sso_checked	1
+accounts.google.com	FALSE	/	TRUE	1794373288	OTZ	8824621_28_32_123600_28_436080
+.vk.com	TRUE	/	TRUE	1823317377	remixstid	1049905078_4TFjmDsgwHIHqQpHUVtaTf54AhUwoPoB3pEm8I4Dttg
+.vk.com	TRUE	/	TRUE	1823317377	remixstlid	9070217242210108484_RRJcyzzlBOh9EKP9iJMZwE2x9TJzRmS7BZ0WVvppZPc
+.dzen.ru	TRUE	/	FALSE	1820552638	tmr_lvid	4093b11a007cc3885a7d6becff55df16
+.dzen.ru	TRUE	/	FALSE	1820552638	tmr_lvidTS	1791781378906
+.dzen.ru	TRUE	/	TRUE	1823317379	_ym_uid	1791781379418807677
+.dzen.ru	TRUE	/	TRUE	1823317379	_ym_d	1791781379
+.dzen.ru	TRUE	/	FALSE	1791867838	is_auth_through_phone	true
+.dzen.ru	TRUE	/	FALSE	1791867838	is_online_stat	false
+.dzen.ru	TRUE	/	FALSE	1823317438	Zen-User-Data	{%22zen-theme%22:%22light%22%2C%22zen-theme-setting%22:%22light%22}
+.dzen.ru	TRUE	/	TRUE	1791853379	_ym_isad	2
+.dzen.ru	TRUE	/	FALSE	1822885380	stable_city	0
+.dzen.ru	TRUE	/	FALSE	1791867780	has_stable_city	true
+.dzen.ru	TRUE	/	FALSE	1826341381	zen_gid	10502
+.dzen.ru	TRUE	/	FALSE	1826341381	zen_vk_gid	2249
+.dzen.ru	TRUE	/	FALSE	1826341381	zen_extra_gid	
+.dzen.ru	TRUE	/	FALSE	1826341381	zen_extra_vk_gid	
+.dzen.ru	TRUE	/	FALSE	1791867780	front_fpid	urcfsIXwez5Iz4YsZbsbN
+.dzen.ru	TRUE	/	FALSE	1807333380	compliance-alert	true
+.dzen.ru	TRUE	/	FALSE	0	logical-device-width	1592
+.dzen.ru	TRUE	/	FALSE	0	logical-device-height	776
+.vk.com	TRUE	/	TRUE	1823519498	remixlang	0
+passport.yandex.ru	FALSE	/	TRUE	1826341394	uniqueuid	bbc0f16b57fc44b0b22e4b7ee25323441791781392
+mc.yandex.com	FALSE	/	TRUE	0	yabs-sid	511066671791781394
+.yandex.ru	TRUE	/	TRUE	1823337616	gdpr	0
+.yandex.ru	TRUE	/	TRUE	1823317399	_ym_uid	1791781396464520707
+.yandex.ru	TRUE	/	TRUE	1823317399	_ym_d	1791781399
+.yandex.com	TRUE	/	TRUE	1826341400	yandexuid	2057550491791781264
+.yandex.com	TRUE	/	TRUE	1826341400	yuidss	2057550491791781264
+.yandex.com	TRUE	/	TRUE	1826341400	i	u7EgcwQDg89H7/8hl+pAucR2O5yPpchmX49pULgsMXJBJ/562fHjuHd6wbA0AxOCU0SYDZoDP6ew0Vtr7WdddPjdaQI=
+.yandex.com	TRUE	/	TRUE	1826341400	yp	1791867797.yu.9069183861791781394
+.yandex.com	TRUE	/	TRUE	1823317397	ymex	1794373397.oyu.9069183861791781394#1823317394.yrts.1791781394#1823317394.yrtsi.1791781394
+.mc.yandex.com	TRUE	/	TRUE	1791867797	sync_cookie_ok	synced
+.yandex.com	TRUE	/	TRUE	1826341420	_yasc	DPEiGEj2q1s8Bhf+YcBRV/XncuVYGrFa6h5+uLdxqynxtIW6pC6VLL1Iakt6Qbeoij9cOhY=
+.yandex.ru	TRUE	/	TRUE	1823317424	yandex_login	pirner4444
+.yandex.ru	TRUE	/	TRUE	1826341424	Session_id	3:1791781421.5.0.1791781421520:ImBTMw:1288.1.2:1|1773749552.-1.20002.3:1791781421|3:12249694.152772.f44q9Fy542NZ58moXFHmMiEJX3U
+.yandex.ru	TRUE	/	TRUE	1826341424	sessar	1.2118107.CiDVu0bBMlZufjgJilOeiwbQawzFvcMUu2Gtk2cWr64zgQ.FRIJHXOm_9yXOjXs2vFte6fbSvqByoiNDlN96lBFOOA
+.yandex.ru	TRUE	/	TRUE	1826341424	sessionid2	3:1791781421.5.0.1791781421520:ImBTMw:1288.1.2:1|1773749552.-1.20002.3:1791781421|3:12249694.152772.fakesign0000000000000000000
+.passport.yandex.ru	TRUE	/	TRUE	1826341424	sessguard	1.1791781421.1791781421520:ImBTMw:1288..3.500:2249790.zwGmSiSv.hKOzNvmOfcPuMhE-Wzrqro1_YmA
+.yandex.ru	TRUE	/	FALSE	1826341424	L	dAdEfV90TVddVXB6RmhVAARZeVxbZ1xXQB82IxAQREJgbg==.1791781421.2241931.368472.eb63110cea5a688c723c8790a555c81b
+.passport.yandex.ru	TRUE	/	TRUE	1826341424	lah	2:1854853421.12249724.53GTX7hcA9nI_geS.MsJmB3K2YR1kqNiztO2YsuSQPr35rSv_NkX_.BUWrWhfxCnxr1oLBZOrqqw
+.passport.yandex.ru	TRUE	/	TRUE	1826341424	mda2_beacon	1791781421909
+oauth.yandex.ru	FALSE	/	TRUE	1826341432	uniqueuid	122081841791781429
+.yandex.ru	TRUE	/	TRUE	1791853433	_ym_isad	2
+mc.yandex.ru	FALSE	/	TRUE	0	yabs-sid	1875645611791781431
+.yandex.ru	TRUE	/	TRUE	1823317431	yuidss	2057550491791781264
+.yandex.ru	TRUE	/	TRUE	1823317431	ymex	1823317431.yrts.1791781431
+.dzen.ru	TRUE	/	TRUE	1823317435	zen_session_id	eq3ra9fqqciKK0pKGngJbOYf00xYTF76hAQ.1791781433130
+.sso.dzen.ru	TRUE	/	TRUE	1826341436	Session_id	3:1791781433.5.0.1791781433691:ImBTMw:2bcb.1.2:1|1773749552.-1.20002.3:1791781421|64:12249732.625073.Ki6nz-TWFJKdxwmA_XZu_ahivis
+.sso.dzen.ru	TRUE	/	TRUE	1826341436	sessar	1.2118107.CiBtVpauIdiN9UNSsfWQDSm6LAg3NXKFcAu55CkBMQpW7w.lTwJQ54lgZ2zducIKY72WkwXDv6DqYdV2VdtaJ81OP8
+.dzen.ru	TRUE	/	TRUE	1826341436	dzen_sess_id	y0__wgBELCK5c0GGI6OOiCKopGxGND1RY_vbtJl23miGLEWbYwyp9is
+.dzen.ru	TRUE	/	TRUE	1823317436	yandex_login	pirner4444
+.dzen.ru	TRUE	/	TRUE	0	ys	c_chck.1768481122#udn.cDpwaXJuZXI0NDQ0
+.sso.dzen.ru	TRUE	/	TRUE	1826341436	i	qYpAez9F/dbtU+BzvYYsZ746V+z0OwWLs3BnV4vUCSfwb9a+nPYf2kY67CRFan1NuFeGkwWbuKrdWhWbifumfszZeUE=
+.dzen.ru	TRUE	/	TRUE	1826341436	mda2_beacon	1791781434066
+.dzen.ru	TRUE	/	TRUE	1826341437	_yasc	/cQMac+ivn1ZOCHXiiRtelF3NcZLAmNXrqfFl5bAN86Da29jM+Ulahve9Hwc4G+kM31PEoaB04hisCCRnUS4O0QhRN0tZHZ95M4A4uNdN4k=
+dzen.ru	FALSE	/	FALSE	1792386239	domain_sid	urcfsIXwez5Iz4YsZbsbN%3A1791781438715
+.dzen.ru	TRUE	/	FALSE	1823317439	skip_glif_onboarding	true
+dzen.ru	FALSE	/	FALSE	1791867841	tmr_detect	0%7C1791781441443
+.youtube.com	TRUE	/	TRUE	1807333444	__Secure-BUCKET	CJEB
+.yandex.com	TRUE	/	TRUE	1826341442	bh	EkAiTWljcm9zb2Z0IEVkZ2UiO3Y9IjE1NSIsIkNocm9taXVtIjt2PSIxNTUiLCJOb3QoQTpCcmFuZCI7dj0iMjQiGgN4ODYiDTE1NS4wLjQyODMuNDUqAj8wOgdXaW5kb3dzQgYxMC4wLjBKAjY0UloiTWljcm9zb2Z0IEVkZ2UiO3Y9IjE1NS4wLjQyODMuNDUiLCJDaHJvbWl1bSI7dj0iMTU1LjAuODA1OS40MCIsIk5vdChBOkJyYW5kIjt2PSIyNC4wLjAuMCJgwtSx1gZqIdzK4f8IktihsQOfz+HqA/v68OcN6//99g+htc2HCIDBAw==
+.youtube.com	TRUE	/	TRUE	1826341454	LOGIN_INFO	AFmmF2swRQIgNuhvqTOdYnDhOOzGZ_LvuLqk0blALZSaJho4AhY5z3ECIQD1lTzB-ABFvO6KnY_fvqMANcu-ORAu2fKCiDuznvDqrg:QUQ3MjNmenRzNDhzRkdPTnJyRFg0MzJwdV9xcUJPZW0zd2JpMXYwTlpEZlk4VHNZclZJTnZ6Q1Z3aTR1ckNRVW92MFotaU5yRUR6WVZwTE5ITGFuOWFZY1FTTUNjN0hhRnFlUFQ5bFdCNlVzbXFQNUU5SS1Rb0Z0b1pkTmNDNi1BRnhoNmJJa0lFbmkwb2UzUWRjMWI2bW1sbFhBeFlsT3NB
+.youtube.com	TRUE	/	TRUE	1825909444	__Secure-YEC	CgtWV2RvcjRKbF9CUSjO1LHWBjIoCgJGUhIiEh4SHAsMDg8QERITFBUWFxgZGhscHR4fICEiIyQlJicgH2LgAgrdAjE4LllURT1jQzZhWHJDREl0RWtBWEpWUHhOYTNycHZVR3c4RmpXdF94SW4wRm9VWm5DMjVOaGt6RHh0dDZzYTdqTU92OGROOXdKMWxDcThnb2hYejRhaDZYcTVDamFZVXJVMkV3ZVhtNnd5bG1IMEZtdTVvWURMN2I1eUUzZWszODdsazV3aGd1clJHbmJmT3RGODdGeGhNOHg1VkhDWWJHSkE3QjBTOW9acWZ4VVNZci12RFpzd2czblVHWU5GbGxCMzUzTDY1NGRvX0JhNkxZVldPV0swRzN4U2Z3ZXM5YVZSRi1RdlBTQ1hsQkUzbnJCRFcwckNuVUpDTC04dlJtVVFXZ3BySGcyeW9XVHpROU1VR0VKRDVLOFJObkhFMmZXNEhBUEhoLV9JWWJ2d2VRZnRzZUlGNDRMWjMwbUlUV2tJRW96b0MtNTdGNTlRSDVOMWItZDJsTW5RRGc%3D
+.youtube.com	TRUE	/	TRUE	1825909461	__Secure-YENID	CoECCAYSswEBWybZ6B-bK3a-l19tDSAOv2_ekUPd66QNntqgySXqIK1HLKjGYJ_YmUp5n_qQ9s0DFJj_fUhoQcYFyvTnXXZS3fOGl6RkpDrEAqBUtEOLiMjH61Mm-E7XnvB7ldIdIQlUIMOFg0dPK-3DT0N0J_7I7-UZcKWmASuMKYTJmsy36ksse2TQOfernnbyUo8yrsXdc4Ovk8-w6YwDl6wRiW-ELY-JOXMIYzhvzfDWC0zAlXPrOygGMkUBsmifZdYvsswdcocJksB2-txDrfgmyhfs8RVsT9KCo15maaRftkPgOL8tB_EV_CKmXY2jNveFOdJsVCpkB9eg-W5WogM
+myaccount.google.com	FALSE	/	TRUE	1826341473	OSID	g.a000DgnEQddvaIPtBU1CIbcAhCJ1uw78MFlFru58850j_FEra8ZerjghneH4tXJUbUa8tEWyFgACgYKARQSARQSFQHGX2Miq7NygEDCVRVnrT8L1jz3GxoVAUF8yKp6Gc99BXcv-5zZXYZPUGNI0076
+myaccount.google.com	FALSE	/	TRUE	1826341473	__Secure-OSID	g.a000DgnEQddvaIPtBU1CIbcAhCJ1uw78MFlFru58850j_FEra8ZeQd6y4K9nFt5dZfauYHLkYQACgYKAWcSARQSFQHGX2MiebAI05kxlD1TNI9iVTQXRRoVAUF8yKoJEHwYUp4arPWJ1Lhcj_E30076
+myaccount.google.com	FALSE	/	TRUE	1794373474	OTZ	8824625_28_32_123600_28_436080
+.youtube.com	TRUE	/	TRUE	1826341510	PREF	tz=Asia.Novosibirsk&f4=10000
+.doubleclick.net	TRUE	/	TRUE	1825477541	IDE	AHWqTUmWdhKFLVxIKMnaUbPie6PUxkLAs05Q76nH5MOdQaHPIy9IyPAYudsK2O94RMk
+ogs.google.com	FALSE	/	TRUE	1794373655	OTZ	8824628_28_32_123600_28_436080
+.youtube.com	TRUE	/	FALSE	1823318060	SIDCC	AKEyXzWWvlieuKwbvYyqt8NWscVblAz4kkj6Jj6CPzkiyj2iMpnYTkI2Ibwcg9SS-ZR8ckXJeA
+.youtube.com	TRUE	/	TRUE	1823318060	__Secure-1PSIDCC	AKEyXzUGB9Kc8uD4GMC7QqThNRuCFVKL5Ehqo-QR5mHAJKCxZrv7rqhAA2pwtFuuTrYvdFSP
+.youtube.com	TRUE	/	TRUE	1823318060	__Secure-3PSIDCC	AKEyXzUv0yo6YieCOP3-AE2089ArkOiId--WvOsMQ3knMsqG9titG18lPg6k2Os4ZS4T1gH_
+.msn.com	TRUE	/	TRUE	1792405076	App-User	%7B%22userId%22%3A%22m-1092B68E97166CF615C9A17E96DB6DDD%22%2C%22cohorts%22%3A%5B%7B%22name%22%3A%22SuperCold%22%2C%22everSelected%22%3Afalse%2C%22reason%22%3A%22MatchedBySignal%22%7D%5D%2C%22accountType%22%3A%22NA%22%2C%22identityType%22%3A%22App%22%2C%22settings%22%3A%7B%22userSettings%22%3A%7B%22rubyRefreshDaily%22%3A%220%22%7D%7D%2C%22responseCreationDateTime%22%3A%222026-10-12T10%3A17%3A53.3003250Z%22%2C%22debugId%22%3A%22d3a54497-3de7-436a-9e52-fdc804448aa9%7C2026-10-12T10%3A17%3A53.3003275Z%7CAuth%7CNEU-CF%7Caksgen0000001q%22%7D
+ntp.msn.com	FALSE	/	FALSE	1826360276	sptmarket	ru%7C%7Cru%7Cru-ru%7Cru-ru%7Cru%7C%7Creason%3DRevIP%3Aru%7Ccf%3D8%7CRefA%3D6accb3d13b7c4f44ab9b71cb3900a390.RefC%3D2026-10-12T10%3A17%3A53Z
+.msn.com	TRUE	/	TRUE	1826360276	USRLOC	CLOC=LAT=48.5829|LON=7.7437|A=50000|TS=261012103127|SRC=I&BID=MjYxMDEyMTczMTI3X2RjMGYyNTFkOWY0YjMwNGM3ODNiM2MzNjlkM2MxOGE0YTNhYWZhMDhiYTM3MWVkNmU0ZGIzZGE3M2U4N2M2MzM=
+.msn.com	TRUE	/	TRUE	1825496278	MUID	1092B68E97166CF615C9A17E96DB6DDD
+ntp.msn.com	FALSE	/	FALSE	1825496276	MUIDB	1092B68E97166CF615C9A17E96DB6DDD
+.msn.com	TRUE	/	TRUE	0	_EDGE_S	F=1&SID=2F7C7A880555694B06E26D7804986813
+.msn.com	TRUE	/	FALSE	1825496276	_EDGE_V	1
+.ntp.msn.com	TRUE	/	FALSE	1823336276	sptmarket_restored	ru%7C%7Cru%7Cru-ru%7Cru-ru%7Cru%7C%7Creason%3DRevIP%3Aru%7Ccf%3D8%7CRefA%3D6accb3d13b7c4f44ab9b71cb3900a390.RefC%3D2026-10-12T10%3A17%3A53Z
+.scorecardresearch.com	TRUE	/	TRUE	1825496667	UID	10F6359ffb0860be84b70fb1791800274
+.bing.com	TRUE	/	TRUE	1825496277	MUID	1092B68E97166CF615C9A17E96DB6DDD
+.c.bing.com	TRUE	/	TRUE	1792405077	MR	0
+.c.bing.com	TRUE	/	TRUE	1825496277	SRM_B	1092B68E97166CF615C9A17E96DB6DDD
+.c.bing.com	TRUE	/	TRUE	1825496277	SRM_M	1092B68E97166CF615C9A17E96DB6DDD
+.c.msn.com	TRUE	/	TRUE	1825496278	SRM_M	1092B68E97166CF615C9A17E96DB6DDD
+.c.msn.com	TRUE	/	TRUE	1792405078	MR	0
+.microsoft.com	TRUE	/	TRUE	1791886783	MSCC	NR
+.google.com	TRUE	/	TRUE	1823336646	__Secure-1PSIDTS	sidts-CjEBkldj_wcsOwIPZvTqiG2YJSwb_7BsLx2KlnATDaZs0EKbcIDmJsSAoQMh9DpnpfaWEAA
+.google.com	TRUE	/	TRUE	1823336646	__Secure-3PSIDTS	sidts-CjEBkldj_wcsOwIPZvTqiG2YJSwb_7BsLx2KlnATDaZs0EKbcIDmJsSAoQMh9DpnpfaWEAA
+.yandex.ru	TRUE	/	TRUE	1826360699	pcuid_context	9633749101791800696
+.facebook.com	TRUE	/	TRUE	1826360799	datr	1rXMai042WcrHBNf3YKWXZmk
+.facebook.com	TRUE	/	TRUE	1826361577	sb	1rXMar7Lt_nL3PQLhE_hbNxY
+.facebook.com	TRUE	/	TRUE	1792406392	wd	1592x776
+.facebook.com	TRUE	/	TRUE	1792405669	locale	ru_RU
+.yandex.ru	TRUE	/	TRUE	1793010498	cycada	NH7yqIFyBZxgLhPq9LcoZ6WrsH9IvU2pP4NCnPPnpXI=
+.msn.com	TRUE	/	TRUE	1799577614	msnup	%7B%22cnex%22%3A%22no%22%7D
+.msn.com	TRUE	/	TRUE	1825496917	MUIDB	1092B68E97166CF615C9A17E96DB6DDD
+.yandex.ru	TRUE	/	TRUE	1826360922	is_gdpr	1
+.yandex.ru	TRUE	/	TRUE	1826360922	is_gdpr_b	CL7bERCNoQMYAQ==
+.yandex.ru	TRUE	/	TRUE	1826360929	_yasc	VZlq0azwAYpowpgh9T/VwYOy0DMyDYXimc/XvbHcbV4MbBKd+aYTI63ZgLS0r+AGum/Cs73NvE0/kstml2WzeHmk0UOucFpqG1yMhfWfdafdA/LklLarokA=
+.google.com	TRUE	/	TRUE	1825967996	__Secure-ENID	CqACCAIS0gEBAQxeReJGlasekdit8IwK302C982Rwg67f7vzzE6GrGbOTG5giJm5LrvJO6ySDsStWG5Q-25bMYyKuXLO7XuC2VkfjBWY1Gbt5wKueR_Fzwi3JI2BWNknVupOYu9KnFM1JzuHgAadRMFzmWArjZC27JnilMOnyII6VPQa116n44TIpo3rys-ryMWEq7HcQtM_sJJkbs7Fum43mX00VCf2Oq6GMfzNhKR_Jc4mAC4tXFIMDEdrvb97IajKYPAQ4BXzVnbScu7a8ZPT83PrCUcU34YoAjJFAX1sxKp3m2l3acjIR494AeIhWb2Z4dAPx7VKHlMh3OVuF_aRkdUVugm8_Y5MbRF2hQP0dAz4I0zg0Jn4I5LZ2jjFjZsO
+.google.com	TRUE	/	TRUE	1807592853	NID	CvcCCAESqQIBOxGDSIM9woz3ZzumcL_tlp8S5P03-kwtmkh9RPDyZX9xHsaMxyJworDKnFmm-PzBIz7KBFo7GHkYPcwv8vHYmxA_zJYeAIaCemTCuiOF7hI32Vv8BZnksp5uqyeoPd8WoOSmyLF4aNewqDJ43ofd3gKR-mbSwarg8f-m1jpSvrL6n_Z2GXy-yVv7YQgdvDtrWEtCb11__HpfoahKkML2q3LnlGlfe4yh7W4MwUd2g9VJix_0LDiPoUeklZuO_GYSPKvXsVcMbKFgBbluioPllf5AneChzhjrZQjGTsiOxtbf2X9wA3YlwFV1JcZ4kexplREiDrXrAsjjAk6SjvYCTCLKYfV-I4W5TmlelsSHVmMN5bcib0zUOD9dGqc651R5SBMfFiO3St0oATJFAdKsB89EiGR7N2jGpKGAKkKTAnY5zbb-jXbS7sqnfqyCbKJ3I0IOoMO3wWrbswKwO0Xwuk1gFqKlAd4ekW_X_InmsgYF
+.google.com	TRUE	/	FALSE	1826361569	SID	g.a000DgnEQTKq0uZW0GTrLDRKq-Q8yFpe46uHd7j16YnODEaP0GWNO8eREhUHWE4SnuW5Y3XlSQACgYKAQ8SARQSFQHGX2MiajmmeBVBa801WWBV6Aa5AxoVAUF8yKopdrsVNIk1TpRYUf_beC_30076
+.google.com	TRUE	/	TRUE	1826361569	__Secure-1PSID	g.a000DgnEQTKq0uZW0GTrLDRKq-Q8yFpe46uHd7j16YnODEaP0GWNt8Z5Z8pobCyCsSQR8IGQowACgYKAdQSARQSFQHGX2MinYKlEAbOtZa8UhNHqxMWvhoVAUF8yKqFZqdH8xomBgLx099jb7nC0076
+.google.com	TRUE	/	TRUE	1826361569	__Secure-3PSID	g.a000DgnEQTKq0uZW0GTrLDRKq-Q8yFpe46uHd7j16YnODEaP0GWNUBsst-6mTfXfiH1kj7zobQACgYKAUoSARQSFQHGX2MiroBPzmJ2mHKwghIMz0_6jhoVAUF8yKpkjSL_HlokOEBx6YOGa3p20076
+accounts.google.com	FALSE	/	TRUE	1826361569	LSID	o.chromewebstore.google.com|o.myaccount.google.com|s.FR|s.RU|s.youtube:g.a000DgnEQcEFghZs2UbdgohpjOsKjz2cSRd8COYSRecUreCak9O6ez8nyu7siARJyDQrugzGhQACgYKAcgSARQSFQHGX2Mi0XLb3ClPCXlz46HLitiYzxoVAUF8yKoSR8eKa_DIt7fn-WeDysmK0076
+accounts.google.com	FALSE	/	TRUE	1826361569	__Host-1PLSID	o.chromewebstore.google.com|o.myaccount.google.com|s.FR|s.RU|s.youtube:g.a000DgnEQcEFghZs2UbdgohpjOsKjz2cSRd8COYSRecUreCak9O6-coD7KgmfPOGl3om_VTTAwACgYKAQoSARQSFQHGX2MiKHKewJdD5iCkccOaNMZ6RRoVAUF8yKrxAeZ6IEtcyRVWNh7yrm4D0076
+accounts.google.com	FALSE	/	TRUE	1826361569	__Host-3PLSID	o.chromewebstore.google.com|o.myaccount.google.com|s.FR|s.RU|s.youtube:g.a000DgnEQcEFghZs2UbdgohpjOsKjz2cSRd8COYSRecUreCak9O6JcgCP-0v_p644BhoPoBuegACgYKAVsSARQSFQHGX2MiKCY25Pa7yGjRQCz9ThToGxoVAUF8yKphdr7quYniVmZWs4P-1UPq0076
+.google.com	TRUE	/	FALSE	1826361569	HSID	AcQKogMgZ9SN5hxrS
+.google.com	TRUE	/	TRUE	1826361569	SSID	A2tccGUAWwnVO5QYm
+.google.com	TRUE	/	FALSE	1826361569	APISID	F80c06n9I93nhGtw/AEqsAfQ_2sE46iW6E
+.google.com	TRUE	/	TRUE	1826361569	SAPISID	AkyVdxbtFe8UGEfC/AAm8DNXi3OV6JZQtl
+.google.com	TRUE	/	TRUE	1826361569	__Secure-1PAPISID	AkyVdxbtFe8UGEfC/AAm8DNXi3OV6JZQtl
+.google.com	TRUE	/	TRUE	1826361569	__Secure-3PAPISID	AkyVdxbtFe8UGEfC/AAm8DNXi3OV6JZQtl
+accounts.google.com	FALSE	/	TRUE	1826361569	ACCOUNT_CHOOSER	AFx_qI6ZvVjht_1OXeS8klzmWK5RnwuIgIC4LjS6m8uZZfR6IPSSOMacps60fdOhZ8CwrwFupG8wx61pKY6Mid0_mB7eC93fMTVPTVHfCIuAjq0mtynPUR-40blGf-S-tWDFekQqgUYuNbGYiDIcmMQu2Tk63ASV53XevUfOovkuk42pYoxfc9L9gIQXLpHK2sdKipSjr6GPSDkyeMuEvHOe7HkmfV131oVyLtcGaRz0RyHakLNt0Oo
+accounts.google.com	FALSE	/	TRUE	1826361569	__Host-GAPS	1:3YllPDGVGDW68E8bQpoZNlyTsLJm9_G5GuEj237RSWpffUh7tSZht9u4MZybBkpVCgu-E27t3D4O5xzJ4KGRlSHimJ78Iw:mOjjB2w-SLExzQn6
+accounts.google.com	FALSE	/	TRUE	1826361569	SMSV	ADHTe-CdkneiuWW_VIbXTtos4qjsoK0XVcZvAR0ckreIqtULJFSVpaH5tCREucj0t9LzfhYOGZGpEOPD9BtOq_LB8Y1Hy3r_-6tp9fQhZ5TTxvzq0IbNDp4
+.youtube.com	TRUE	/	FALSE	1826361569	SID	g.a000DgnEQTKq0uZW0GTrLDRKq-Q8yFpe46uHd7j16YnODEaP0GWNO8eREhUHWE4SnuW5Y3XlSQACgYKAQ8SARQSFQHGX2MiajmmeBVBa801WWBV6Aa5AxoVAUF8yKopdrsVNIk1TpRYUf_beC_30076
+.youtube.com	TRUE	/	TRUE	1823337569	__Secure-1PSIDTS	sidts-CjQBkldj_xSGAzcnm8kl5uPc-cW6OHYwXXblvVHs6S86_M8BmDijQaWMgJLf3bWiGPvZVQ0kEAA
+.youtube.com	TRUE	/	TRUE	1823337569	__Secure-3PSIDTS	sidts-CjQBkldj_xSGAzcnm8kl5uPc-cW6OHYwXXblvVHs6S86_M8BmDijQaWMgJLf3bWiGPvZVQ0kEAA
+.youtube.com	TRUE	/	TRUE	1826361569	__Secure-1PSID	g.a000DgnEQTKq0uZW0GTrLDRKq-Q8yFpe46uHd7j16YnODEaP0GWNt8Z5Z8pobCyCsSQR8IGQowACgYKAdQSARQSFQHGX2MinYKlEAbOtZa8UhNHqxMWvhoVAUF8yKqFZqdH8xomBgLx099jb7nC0076
+.youtube.com	TRUE	/	TRUE	1826361569	__Secure-3PSID	g.a000DgnEQTKq0uZW0GTrLDRKq-Q8yFpe46uHd7j16YnODEaP0GWNUBsst-6mTfXfiH1kj7zobQACgYKAUoSARQSFQHGX2MiroBPzmJ2mHKwghIMz0_6jhoVAUF8yKpkjSL_HlokOEBx6YOGa3p20076
+.youtube.com	TRUE	/	FALSE	1826361569	HSID	AZqZFcuLc9UMdy1hl
+.youtube.com	TRUE	/	TRUE	1826361569	SSID	AWPhVHLCcM0sTvVLD
+.youtube.com	TRUE	/	FALSE	1826361569	APISID	F80c06n9I93nhGtw/AEqsAfQ_2sE46iW6E
+.youtube.com	TRUE	/	TRUE	1826361569	SAPISID	AkyVdxbtFe8UGEfC/AAm8DNXi3OV6JZQtl
+.youtube.com	TRUE	/	TRUE	1826361569	__Secure-1PAPISID	AkyVdxbtFe8UGEfC/AAm8DNXi3OV6JZQtl
+.youtube.com	TRUE	/	TRUE	1826361569	__Secure-3PAPISID	AkyVdxbtFe8UGEfC/AAm8DNXi3OV6JZQtl
+.google.fr	TRUE	/	FALSE	1826361570	SID	g.a000DgnEQTKq0uZW0GTrLDRKq-Q8yFpe46uHd7j16YnODEaP0GWNO8eREhUHWE4SnuW5Y3XlSQACgYKAQ8SARQSFQHGX2MiajmmeBVBa801WWBV6Aa5AxoVAUF8yKopdrsVNIk1TpRYUf_beC_30076
+.google.fr	TRUE	/	TRUE	1826361570	__Secure-1PSID	g.a000DgnEQTKq0uZW0GTrLDRKq-Q8yFpe46uHd7j16YnODEaP0GWNt8Z5Z8pobCyCsSQR8IGQowACgYKAdQSARQSFQHGX2MinYKlEAbOtZa8UhNHqxMWvhoVAUF8yKqFZqdH8xomBgLx099jb7nC0076
+.google.fr	TRUE	/	TRUE	1826361570	__Secure-3PSID	g.a000DgnEQTKq0uZW0GTrLDRKq-Q8yFpe46uHd7j16YnODEaP0GWNUBsst-6mTfXfiH1kj7zobQACgYKAUoSARQSFQHGX2MiroBPzmJ2mHKwghIMz0_6jhoVAUF8yKpkjSL_HlokOEBx6YOGa3p20076
+.google.fr	TRUE	/	FALSE	1826361570	HSID	AZqZFcuLc9UMdy1hl
+.google.fr	TRUE	/	TRUE	1826361570	SSID	AWPhVHLCcM0sTvVLD
+.google.fr	TRUE	/	FALSE	1826361570	APISID	F80c06n9I93nhGtw/AEqsAfQ_2sE46iW6E
+.google.fr	TRUE	/	TRUE	1826361570	SAPISID	AkyVdxbtFe8UGEfC/AAm8DNXi3OV6JZQtl
+.google.fr	TRUE	/	TRUE	1826361570	__Secure-1PAPISID	AkyVdxbtFe8UGEfC/AAm8DNXi3OV6JZQtl
+.google.fr	TRUE	/	TRUE	1826361570	__Secure-3PAPISID	AkyVdxbtFe8UGEfC/AAm8DNXi3OV6JZQtl
+.google.fr	TRUE	/	TRUE	1807592537	NID	Cu4CCAESoAIBOxGDSNptEkhDwN4S5W_kL8nux7tdXF78abSAn4lq2QlKOzhoNgIqVlP2LtwyEGxJvfoB_Qdh9xcOV7b8ElZYcPT_849fVZBB9awuw2bsTlBGupm477TGlzPgCCIXS2eV_QiYXOAT1mRV4ZEcWsE51teMy8K-fuRHqGdDsBpYdEfZRdAmJHK0VmUhMQHXMa6jQAaHBFrHgyzig7J8q0lbaMsZZMLlXg2UmVNu4dumNT7aWZa0GpB7-6ovqArCJLRf57IC05c2aoVh0Dq1V9X8qI5NC2dvaex2G4MM6Z0YFZUIsN7wRyAXOXkKxEqcEpjQEDWu5bSX2EIeqAZzRFafM4XrpTFM6JNBkmnJ5CoIhzMvWW5wrE5GPavCq37eHC4oATJFAdKsB88kUaL11LcFl_k5hJOhMmz7zuymVch1_evkpzeXbULp1bH4uB57T2Hgi0mikf6Ha5SIq-kq2mlB4o1eCpdGSeYH
+.google.ru	TRUE	/	FALSE	1826361571	SID	g.a000DgnEQTKq0uZW0GTrLDRKq-Q8yFpe46uHd7j16YnODEaP0GWNO8eREhUHWE4SnuW5Y3XlSQACgYKAQ8SARQSFQHGX2MiajmmeBVBa801WWBV6Aa5AxoVAUF8yKopdrsVNIk1TpRYUf_beC_30076
+.google.ru	TRUE	/	TRUE	1826361571	__Secure-1PSID	g.a000DgnEQTKq0uZW0GTrLDRKq-Q8yFpe46uHd7j16YnODEaP0GWNt8Z5Z8pobCyCsSQR8IGQowACgYKAdQSARQSFQHGX2MinYKlEAbOtZa8UhNHqxMWvhoVAUF8yKqFZqdH8xomBgLx099jb7nC0076
+.google.ru	TRUE	/	TRUE	1826361571	__Secure-3PSID	g.a000DgnEQTKq0uZW0GTrLDRKq-Q8yFpe46uHd7j16YnODEaP0GWNUBsst-6mTfXfiH1kj7zobQACgYKAUoSARQSFQHGX2MiroBPzmJ2mHKwghIMz0_6jhoVAUF8yKpkjSL_HlokOEBx6YOGa3p20076
+.google.ru	TRUE	/	FALSE	1826361571	HSID	AZqZFcuLc9UMdy1hl
+.google.ru	TRUE	/	TRUE	1826361571	SSID	AWPhVHLCcM0sTvVLD
+.google.ru	TRUE	/	FALSE	1826361571	APISID	F80c06n9I93nhGtw/AEqsAfQ_2sE46iW6E
+.google.ru	TRUE	/	TRUE	1826361571	SAPISID	AkyVdxbtFe8UGEfC/AAm8DNXi3OV6JZQtl
+.google.ru	TRUE	/	TRUE	1826361571	__Secure-1PAPISID	AkyVdxbtFe8UGEfC/AAm8DNXi3OV6JZQtl
+.google.ru	TRUE	/	TRUE	1826361571	__Secure-3PAPISID	AkyVdxbtFe8UGEfC/AAm8DNXi3OV6JZQtl
+.google.ru	TRUE	/	TRUE	1807592538	NID	Cu0CCAESnwIBOxGDSHLLlFN-sxCNELjro3s1ajfXLeV9G44r1vuhFXmZjp3Uj0opVwzOJQJ4SQBcfEoXGBMxB2noZWj08YVdmT4SSJs8aZwRlUsKJU_5dfn16Rsqtw_Lp4jvztMvxwvhiliCfxYgdyEjFOryw4opOpZ9gFgw42VGWofNAiDtre9lDKhIY85NEZ4s7I8nXZ0yoJz9GGioeKx_0l-B8ocjSicln85rOnARxo1alBEP4x237MoxTK_6ixEjAY2cUTF13OxU7IBcUDwfZ5ZrtRvHpnGIcKlhyISP2-Sg58j7EuZg_L-HR52dVKZija6nK1yL5KmTOPuEQi7VY6fBYmGjTpIZozz9krELi0XR0JAtECMpFqaJca7F-nv7D5gKzygBMkUB0qwHzyxgFw1cyKKNgr997essjvkedPkP4iayQOXg2vARGgKYMI1otWUzpTv11J49EGe-M8VZAas2aTLRfpup_NBHego
+.google.com	TRUE	/	FALSE	1823337572	SIDCC	AKEyXzUkwT4Um7D1UPLL1sErw88t-gBAe2s3z6LhIdO6FrIkNZajJpXN9tTEqXdpeWu8O2pZ
+.google.com	TRUE	/	TRUE	1823337572	__Secure-1PSIDCC	AKEyXzV9d1qlmveoTewilE8CBcaElgVqJGuEQLiYwiGVSeTv33_gfPTeoch_F6S6lV2LPJybKg
+.google.com	TRUE	/	TRUE	1823337572	__Secure-3PSIDCC	AKEyXzWBpkd_zbUuG99RGo20KG_xRAhZPmY6Bxjf4fc03CX1AEanKgsFCikuwe6imCXh2McK
+.facebook.com	TRUE	/	TRUE	1823337590	c_user	100010271560418
+.facebook.com	TRUE	/	TRUE	1799577578	fr	0icG2WJ9STV17pC3z.AWdAD1RIUZuMO8lk9jrh1Z5qAa63c216EA1Pu6iuvifZQ06weTo.BqzLjn..AAA.0.0.BqzLjn.AWdSbkP4vvaGhp4g672D_sjTxWQ
+.facebook.com	TRUE	/	TRUE	1823337590	xs	18%3AIy7QRlVbLFystA%3A2%3A1791801571%3A-1%3A-1%3A%3AAcxCXD8OP9OAcNWQZnnk18EEyURVhshL4Y1zKYuzVw
+.facebook.com	TRUE	/	TRUE	0	presence	C%7B%22t3%22%3A%5B%5D%2C%22utc3%22%3A1791801593449%2C%22v%22%3A1%7D
+.c.msn.com	TRUE	/	TRUE	0	SM	C
+.yandex.ru	TRUE	/	TRUE	1826361616	yp	2107141421.udn.cDpwaXJuZXI0NDQ0#2107161616.pcs.0#1792645443.dlp.1#1794373443.gph.225_124#1792386244.szm.1%3A1600x900%3A1576x776%3A15#1791822299.iapfr.1#1794479117.hdrc.0
+.yandex.ru	TRUE	/	TRUE	1826361615	bh	EkIiTWljcm9zb2Z0IEVkZ2UiO3Y9IjE1NSIsICJDaHJvbWl1bSI7dj0iMTU1IiwgIk5vdChBOkJyYW5kIjt2PSIyNCIaBSJ4ODYiIg8iMTU1LjAuNDI4My40NSIqAj8wMgIiIjoJIldpbmRvd3MiQggiMTAuMC4wIkoEIjY0IlJcIk1pY3Jvc29mdCBFZGdlIjt2PSIxNTUuMC40MjgzLjQ1IiwgIkNocm9taXVtIjt2PSIxNTUuMC44MDU5LjQwIiwgIk5vdChBOkJyYW5kIjt2PSIyNC4wLjAuMCJaAj8wYI/ystYGaiHcyuH/CJLYobEDn8/h6gP7+vDnDev//fYPobXNhwiAwQM=
+web.archive.org	FALSE	/	FALSE	0	wb-p-SERVER	wwwb-app204
+.archive.org	TRUE	/	FALSE	1823337623	donation-identifier	815838f62a2ae21a21ac6bde5b37d315
+web.archive.org	FALSE	/	FALSE	0	wb-cdx-ui-SERVER	wwwb-app205
+.yandex.ru	TRUE	/	TRUE	0	ys	udn.cDpwaXJuZXI0NDQ0#wprid.1791801613628601-8748935703776976062-balancer-l7leveler-kubr-yp-nrg-139-BAL#c_chck.1768481122
+.web.archive.org	TRUE	/web/20240903025607/https://www.instagram.com/	TRUE	1792406528	wd	1592x776
+.web.archive.org	TRUE	/web/20240903025607/https://www.instagram.com/	TRUE	1823337734	_js_ig_did	A90C5562-47A7-49A7-A9E9-08810C84F317
+.web.archive.org	TRUE	/web/20240903025607/https://www.instagram.com/	TRUE	1826361734	_js_datr	x3rWZlYxRsUDwECCL8IoyJK8
+.web.archive.org	TRUE	/web/20240903025607/https://www.instagram.com/	TRUE	1826361734	mid	ZtZ6xwAEAAHsjVhHaJqKdiAg-HsV
+assets.msn.com	FALSE	/service/segments/recoitems	FALSE	0	_C_Auth	
+.msn.com	TRUE	/service/segments/recoitems	TRUE	0	MUID	
+.msn.com	TRUE	/service/segments/recoitems	TRUE	0	MUIDB	
+assets.msn.com	FALSE	/service/news/feed/pages	FALSE	0	_C_Auth	
+.msn.com	TRUE	/service/news/feed/pages	TRUE	0	MUID	
+.msn.com	TRUE	/service/news/feed/pages	TRUE	0	MUIDB	
+.facebook.com	TRUE	/login/device-based/	TRUE	1799577601	dbln	%7B%22100010271560418%22%3A%22VQfMlwxO%22%7D
+assets.msn.com	FALSE	/service/news/feed	FALSE	0	_C_Auth	
+.msn.com	TRUE	/service/news/feed	TRUE	0	MUID	
+.msn.com	TRUE	/service/news/feed	TRUE	0	MUIDB	
+assets.msn.com	FALSE	/service/msn	FALSE	0	_C_Auth	
+.msn.com	TRUE	/service/msn	TRUE	0	MUID	
+.msn.com	TRUE	/service/msn	TRUE	0	MUIDB	
+ntp.msn.com	FALSE	/edge	FALSE	0	_C_Auth	
+.msn.com	TRUE	/edge	FALSE	1807526413	pglt-edgeChromium-ntp	2083
+.yandex.ru	TRUE	/page	TRUE	1791805216	sq	instagram%20%D0%B2%D0%BE%D0%B9%D1%82%D0%B8
+.yandex.ru	TRUE	/meta	TRUE	1791805216	sq	instagram%20%D0%B2%D0%BE%D0%B9%D1%82%D0%B8
+.instagram.com	TRUE	/	TRUE	1826341266	csrftoken	5EbCFZObfnyovzwWL7KT4l
+.yandex.ru	TRUE	/	TRUE	1826341267	pi	MKHXZKPM8FZ6Q/ekUPMzMjDjPIBITRowpsoJR/OeIaXaqs41/WpGmZiSnxLdIeMz1Lk3co02j3816OnDkYZ76NdjKmk=
+.yandex.ru	TRUE	/	TRUE	1826341267	i	u7EgcwQDg89H7/8hl+pAucR2O5yPpchmX49pULgsMXJBJ/562fHjuHd6wbA0AxOCU0SYDZoDP6ew0Vtr7WdddPjdaQI=
+.yandex.ru	TRUE	/	TRUE	1823317431	yandexuid	2057550491791781264
+.yandex.ru	TRUE	/	TRUE	1823317267	yashr	3300461681791781264
+.dzen.ru	TRUE	/	TRUE	1826341267	zencookie	919585371791781265
+.dzen.ru	TRUE	/	TRUE	1792990869	zen_sso_checked	1
+.passport.yandex.ru	TRUE	/	TRUE	1826341436	mda2_domains	dzen.ru
+.dzen.ru	TRUE	/	TRUE	1826341436	yandexuid	2057550491791781264
+.dzen.ru	TRUE	/	TRUE	1792990869	zen_vk_sso_checked	1
+accounts.google.com	FALSE	/	TRUE	1794373288	OTZ	8824621_28_32_123600_28_436080
+.vk.com	TRUE	/	TRUE	1823317377	remixstid	1049905078_4TFjmDsgwHIHqQpHUVtaTf54AhUwoPoB3pEm8I4Dttg
+.vk.com	TRUE	/	TRUE	1823317377	remixstlid	9070217242210108484_RRJcyzzlBOh9EKP9iJMZwE2x9TJzRmS7BZ0WVvppZPc
+.sso.dzen.ru	TRUE	/	TRUE	1823317379	yashr	7693476171791781376
+.yandex.ru	TRUE	/	TRUE	1826341379	pi	jolUxEOmDuxlIwInkM0wqmUoVw0w4lJ9TFQJ/XzOhSJvlQRKQgCLCLeHJKhlfiPiUlDyoCZzl0iTycqdITSMjB/kdDg=
+.yandex.ru	TRUE	/	TRUE	1823317379	yashr	7627374841791781376
+.dzen.ru	TRUE	/	FALSE	1820552638	tmr_lvid	4093b11a007cc3885a7d6becff55df16
+.dzen.ru	TRUE	/	FALSE	1820552638	tmr_lvidTS	1791781378906
+.dzen.ru	TRUE	/	TRUE	1823317379	_ym_uid	1791781379418807677
+.dzen.ru	TRUE	/	TRUE	1823317379	_ym_d	1791781379
+.dzen.ru	TRUE	/	FALSE	1791867838	is_auth_through_phone	true
+.dzen.ru	TRUE	/	FALSE	1791867838	is_online_stat	false
+.dzen.ru	TRUE	/	FALSE	1823317438	Zen-User-Data	{%22zen-theme%22:%22light%22%2C%22zen-theme-setting%22:%22light%22}
+.dzen.ru	TRUE	/	TRUE	1791853379	_ym_isad	2
+.dzen.ru	TRUE	/	FALSE	1822885380	stable_city	0
+.dzen.ru	TRUE	/	FALSE	1791867780	has_stable_city	true
+.dzen.ru	TRUE	/	FALSE	1826341381	zen_gid	10502
+.dzen.ru	TRUE	/	FALSE	1826341381	zen_vk_gid	2249
+.dzen.ru	TRUE	/	FALSE	1826341381	zen_extra_gid	
+.dzen.ru	TRUE	/	FALSE	1826341381	zen_extra_vk_gid	
+.dzen.ru	TRUE	/	FALSE	1791867780	front_fpid	urcfsIXwez5Iz4YsZbsbN
+.dzen.ru	TRUE	/	FALSE	1807333380	compliance-alert	true
+.dzen.ru	TRUE	/	FALSE	0	logical-device-width	1592
+.dzen.ru	TRUE	/	FALSE	0	logical-device-height	776
+.vk.com	TRUE	/	TRUE	1823519498	remixlang	0
+passport.yandex.ru	FALSE	/	TRUE	1826341394	uniqueuid	bbc0f16b57fc44b0b22e4b7ee25323441791781392
+mc.yandex.com	FALSE	/	TRUE	0	yabs-sid	511066671791781394
+.yandex.ru	TRUE	/	TRUE	1823337616	gdpr	0
+.yandex.ru	TRUE	/	TRUE	1823317399	_ym_uid	1791781396464520707
+.yandex.ru	TRUE	/	TRUE	1823317399	_ym_d	1791781399
+.yandex.com	TRUE	/	TRUE	1826341400	yandexuid	2057550491791781264
+.yandex.com	TRUE	/	TRUE	1826341400	yuidss	2057550491791781264
+.yandex.com	TRUE	/	TRUE	1826341400	i	u7EgcwQDg89H7/8hl+pAucR2O5yPpchmX49pULgsMXJBJ/562fHjuHd6wbA0AxOCU0SYDZoDP6ew0Vtr7WdddPjdaQI=
+.yandex.com	TRUE	/	TRUE	1826341400	yp	1791867797.yu.9069183861791781394
+.yandex.com	TRUE	/	TRUE	1823317397	ymex	1794373397.oyu.9069183861791781394#1823317394.yrts.1791781394#1823317394.yrtsi.1791781394
+.mc.yandex.com	TRUE	/	TRUE	1791867797	sync_cookie_ok	synced
+.yandex.com	TRUE	/	TRUE	1826341420	_yasc	DPEiGEj2q1s8Bhf+YcBRV/XncuVYGrFa6h5+uLdxqynxtIW6pC6VLL1Iakt6Qbeoij9cOhY=
+.yandex.ru	TRUE	/	TRUE	1823317424	yandex_login	pirner4444
+.yandex.ru	TRUE	/	TRUE	1826341424	Session_id	3:1791781421.5.0.1791781421520:ImBTMw:1288.1.2:1|1773749552.-1.20002.3:1791781421|3:12249694.152772.f44q9Fy542NZ58moXFHmMiEJX3U
+.yandex.ru	TRUE	/	TRUE	1826341424	sessar	1.2118107.CiDVu0bBMlZufjgJilOeiwbQawzFvcMUu2Gtk2cWr64zgQ.FRIJHXOm_9yXOjXs2vFte6fbSvqByoiNDlN96lBFOOA
+.yandex.ru	TRUE	/	TRUE	1826341424	sessionid2	3:1791781421.5.0.1791781421520:ImBTMw:1288.1.2:1|1773749552.-1.20002.3:1791781421|3:12249694.152772.fakesign0000000000000000000
+.passport.yandex.ru	TRUE	/	TRUE	1826341424	sessguard	1.1791781421.1791781421520:ImBTMw:1288..3.500:2249790.zwGmSiSv.hKOzNvmOfcPuMhE-Wzrqro1_YmA
+.yandex.ru	TRUE	/	FALSE	1826341424	L	dAdEfV90TVddVXB6RmhVAARZeVxbZ1xXQB82IxAQREJgbg==.1791781421.2241931.368472.eb63110cea5a688c723c8790a555c81b
+.passport.yandex.ru	TRUE	/	TRUE	1826341424	lah	2:1854853421.12249724.53GTX7hcA9nI_geS.MsJmB3K2YR1kqNiztO2YsuSQPr35rSv_NkX_.BUWrWhfxCnxr1oLBZOrqqw
+.passport.yandex.ru	TRUE	/	TRUE	1826341424	mda2_beacon	1791781421909
+oauth.yandex.ru	FALSE	/	TRUE	1826341432	uniqueuid	122081841791781429
+.yandex.ru	TRUE	/	TRUE	1791853433	_ym_isad	2
+mc.yandex.ru	FALSE	/	TRUE	0	yabs-sid	1875645611791781431
+.yandex.ru	TRUE	/	TRUE	1823317431	yuidss	2057550491791781264
+.yandex.ru	TRUE	/	TRUE	1823317431	ymex	1823317431.yrts.1791781431
+.dzen.ru	TRUE	/	TRUE	1823317435	zen_session_id	eq3ra9fqqciKK0pKGngJbOYf00xYTF76hAQ.1791781433130
+.sso.dzen.ru	TRUE	/	TRUE	1826341436	Session_id	3:1791781433.5.0.1791781433691:ImBTMw:2bcb.1.2:1|1773749552.-1.20002.3:1791781421|64:12249732.625073.Ki6nz-TWFJKdxwmA_XZu_ahivis
+.sso.dzen.ru	TRUE	/	TRUE	1826341436	sessar	1.2118107.CiBtVpauIdiN9UNSsfWQDSm6LAg3NXKFcAu55CkBMQpW7w.lTwJQ54lgZ2zducIKY72WkwXDv6DqYdV2VdtaJ81OP8
+.dzen.ru	TRUE	/	TRUE	1826341436	dzen_sess_id	y0__wgBELCK5c0GGI6OOiCKopGxGND1RY_vbtJl23miGLEWbYwyp9is
+.dzen.ru	TRUE	/	TRUE	1823317436	yandex_login	pirner4444
+.dzen.ru	TRUE	/	TRUE	0	ys	c_chck.1768481122#udn.cDpwaXJuZXI0NDQ0
+.sso.dzen.ru	TRUE	/	TRUE	1826341436	i	qYpAez9F/dbtU+BzvYYsZ746V+z0OwWLs3BnV4vUCSfwb9a+nPYf2kY67CRFan1NuFeGkwWbuKrdWhWbifumfszZeUE=
+.dzen.ru	TRUE	/	TRUE	1826341436	mda2_beacon	1791781434066
+.dzen.ru	TRUE	/	TRUE	1826341437	_yasc	/cQMac+ivn1ZOCHXiiRtelF3NcZLAmNXrqfFl5bAN86Da29jM+Ulahve9Hwc4G+kM31PEoaB04hisCCRnUS4O0QhRN0tZHZ95M4A4uNdN4k=
+dzen.ru	FALSE	/	FALSE	1792386239	domain_sid	urcfsIXwez5Iz4YsZbsbN%3A1791781438715
+.dzen.ru	TRUE	/	FALSE	1823317439	skip_glif_onboarding	true
+dzen.ru	FALSE	/	FALSE	1791867841	tmr_detect	0%7C1791781441443
+.youtube.com	TRUE	/	TRUE	1807333444	__Secure-BUCKET	CJEB
+.youtube.com	TRUE	/	TRUE	0	YSC	jRkCAZTAkwo
+.yandex.com	TRUE	/	TRUE	1826341442	bh	EkAiTWljcm9zb2Z0IEVkZ2UiO3Y9IjE1NSIsIkNocm9taXVtIjt2PSIxNTUiLCJOb3QoQTpCcmFuZCI7dj0iMjQiGgN4ODYiDTE1NS4wLjQyODMuNDUqAj8wOgdXaW5kb3dzQgYxMC4wLjBKAjY0UloiTWljcm9zb2Z0IEVkZ2UiO3Y9IjE1NS4wLjQyODMuNDUiLCJDaHJvbWl1bSI7dj0iMTU1LjAuODA1OS40MCIsIk5vdChBOkJyYW5kIjt2PSIyNC4wLjAuMCJgwtSx1gZqIdzK4f8IktihsQOfz+HqA/v68OcN6//99g+htc2HCIDBAw==
+.youtube.com	TRUE	/	TRUE	1826341454	LOGIN_INFO	AFmmF2swRQIgNuhvqTOdYnDhOOzGZ_LvuLqk0blALZSaJho4AhY5z3ECIQD1lTzB-ABFvO6KnY_fvqMANcu-ORAu2fKCiDuznvDqrg:QUQ3MjNmenRzNDhzRkdPTnJyRFg0MzJwdV9xcUJPZW0zd2JpMXYwTlpEZlk4VHNZclZJTnZ6Q1Z3aTR1ckNRVW92MFotaU5yRUR6WVZwTE5ITGFuOWFZY1FTTUNjN0hhRnFlUFQ5bFdCNlVzbXFQNUU5SS1Rb0Z0b1pkTmNDNi1BRnhoNmJJa0lFbmkwb2UzUWRjMWI2bW1sbFhBeFlsT3NB
+.youtube.com	TRUE	/	TRUE	1807333454	__Secure-ROLLOUT_TOKEN	CNrf6LDD-Pms3gEQ3byBg9qzlwMYoKuMhtqzlwM%3D
+.doubleclick.net	TRUE	/	TRUE	1807333456	APC	ATI4zw4HI4zzeGuDqKtQSGk_8YcSzDvgq4_qsZd-UxY9swEts6JMqg
+.youtube.com	TRUE	/	TRUE	1825909444	__Secure-YEC	CgtWV2RvcjRKbF9CUSjO1LHWBjIoCgJGUhIiEh4SHAsMDg8QERITFBUWFxgZGhscHR4fICEiIyQlJicgH2LgAgrdAjE4LllURT1jQzZhWHJDREl0RWtBWEpWUHhOYTNycHZVR3c4RmpXdF94SW4wRm9VWm5DMjVOaGt6RHh0dDZzYTdqTU92OGROOXdKMWxDcThnb2hYejRhaDZYcTVDamFZVXJVMkV3ZVhtNnd5bG1IMEZtdTVvWURMN2I1eUUzZWszODdsazV3aGd1clJHbmJmT3RGODdGeGhNOHg1VkhDWWJHSkE3QjBTOW9acWZ4VVNZci12RFpzd2czblVHWU5GbGxCMzUzTDY1NGRvX0JhNkxZVldPV0swRzN4U2Z3ZXM5YVZSRi1RdlBTQ1hsQkUzbnJCRFcwckNuVUpDTC04dlJtVVFXZ3BySGcyeW9XVHpROU1VR0VKRDVLOFJObkhFMmZXNEhBUEhoLV9JWWJ2d2VRZnRzZUlGNDRMWjMwbUlUV2tJRW96b0MtNTdGNTlRSDVOMWItZDJsTW5RRGc%3D
+.youtube.com	TRUE	/	TRUE	1825909457	VISITOR_PRIVACY_METADATA	CgJGUhIiEh4SHAsMDg8QERITFBUWFxgZGhscHR4fICEiIyQlJicgHw%3D%3D
+.youtube.com	TRUE	/	TRUE	1825909461	__Secure-YENID	CoECCAYSswEBWybZ6B-bK3a-l19tDSAOv2_ekUPd66QNntqgySXqIK1HLKjGYJ_YmUp5n_qQ9s0DFJj_fUhoQcYFyvTnXXZS3fOGl6RkpDrEAqBUtEOLiMjH61Mm-E7XnvB7ldIdIQlUIMOFg0dPK-3DT0N0J_7I7-UZcKWmASuMKYTJmsy36ksse2TQOfernnbyUo8yrsXdc4Ovk8-w6YwDl6wRiW-ELY-JOXMIYzhvzfDWC0zAlXPrOygGMkUBsmifZdYvsswdcocJksB2-txDrfgmyhfs8RVsT9KCo15maaRftkPgOL8tB_EV_CKmXY2jNveFOdJsVCpkB9eg-W5WogM
+myaccount.google.com	FALSE	/	TRUE	1826341473	OSID	g.a000DgnEQddvaIPtBU1CIbcAhCJ1uw78MFlFru58850j_FEra8ZerjghneH4tXJUbUa8tEWyFgACgYKARQSARQSFQHGX2Miq7NygEDCVRVnrT8L1jz3GxoVAUF8yKp6Gc99BXcv-5zZXYZPUGNI0076
+myaccount.google.com	FALSE	/	TRUE	1826341473	__Secure-OSID	g.a000DgnEQddvaIPtBU1CIbcAhCJ1uw78MFlFru58850j_FEra8ZeQd6y4K9nFt5dZfauYHLkYQACgYKAWcSARQSFQHGX2MiebAI05kxlD1TNI9iVTQXRRoVAUF8yKoJEHwYUp4arPWJ1Lhcj_E30076
+myaccount.google.com	FALSE	/	TRUE	1794373474	OTZ	8824625_28_32_123600_28_436080
+.youtube.com	TRUE	/	TRUE	1826341510	PREF	tz=Asia.Novosibirsk&f4=10000
+.doubleclick.net	TRUE	/	TRUE	1825477541	IDE	AHWqTUmWdhKFLVxIKMnaUbPie6PUxkLAs05Q76nH5MOdQaHPIy9IyPAYudsK2O94RMk
+ogs.google.com	FALSE	/	TRUE	1794373655	OTZ	8824628_28_32_123600_28_436080
+.youtube.com	TRUE	/	FALSE	1823318060	SIDCC	AKEyXzWWvlieuKwbvYyqt8NWscVblAz4kkj6Jj6CPzkiyj2iMpnYTkI2Ibwcg9SS-ZR8ckXJeA
+.youtube.com	TRUE	/	TRUE	1823318060	__Secure-1PSIDCC	AKEyXzUGB9Kc8uD4GMC7QqThNRuCFVKL5Ehqo-QR5mHAJKCxZrv7rqhAA2pwtFuuTrYvdFSP
+.youtube.com	TRUE	/	TRUE	1823318060	__Secure-3PSIDCC	AKEyXzUv0yo6YieCOP3-AE2089ArkOiId--WvOsMQ3knMsqG9titG18lPg6k2Os4ZS4T1gH_
+.msn.com	TRUE	/	TRUE	1792405076	App-User	%7B%22userId%22%3A%22m-1092B68E97166CF615C9A17E96DB6DDD%22%2C%22cohorts%22%3A%5B%7B%22name%22%3A%22SuperCold%22%2C%22everSelected%22%3Afalse%2C%22reason%22%3A%22MatchedBySignal%22%7D%5D%2C%22accountType%22%3A%22NA%22%2C%22identityType%22%3A%22App%22%2C%22settings%22%3A%7B%22userSettings%22%3A%7B%22rubyRefreshDaily%22%3A%220%22%7D%7D%2C%22responseCreationDateTime%22%3A%222026-10-12T10%3A17%3A53.3003250Z%22%2C%22debugId%22%3A%22d3a54497-3de7-436a-9e52-fdc804448aa9%7C2026-10-12T10%3A17%3A53.3003275Z%7CAuth%7CNEU-CF%7Caksgen0000001q%22%7D
+ntp.msn.com	FALSE	/	FALSE	1826360276	sptmarket	ru%7C%7Cru%7Cru-ru%7Cru-ru%7Cru%7C%7Creason%3DRevIP%3Aru%7Ccf%3D8%7CRefA%3D6accb3d13b7c4f44ab9b71cb3900a390.RefC%3D2026-10-12T10%3A17%3A53Z
+.msn.com	TRUE	/	TRUE	1826360276	USRLOC	CLOC=LAT=48.5829|LON=7.7437|A=50000|TS=261012103127|SRC=I&BID=MjYxMDEyMTczMTI3X2RjMGYyNTFkOWY0YjMwNGM3ODNiM2MzNjlkM2MxOGE0YTNhYWZhMDhiYTM3MWVkNmU0ZGIzZGE3M2U4N2M2MzM=
+.msn.com	TRUE	/	TRUE	1825496278	MUID	1092B68E97166CF615C9A17E96DB6DDD
+ntp.msn.com	FALSE	/	FALSE	1825496276	MUIDB	1092B68E97166CF615C9A17E96DB6DDD
+.msn.com	TRUE	/	TRUE	0	_EDGE_S	F=1&SID=2F7C7A880555694B06E26D7804986813
+.msn.com	TRUE	/	FALSE	1825496276	_EDGE_V	1
+.ntp.msn.com	TRUE	/	FALSE	1823336276	sptmarket_restored	ru%7C%7Cru%7Cru-ru%7Cru-ru%7Cru%7C%7Creason%3DRevIP%3Aru%7Ccf%3D8%7CRefA%3D6accb3d13b7c4f44ab9b71cb3900a390.RefC%3D2026-10-12T10%3A17%3A53Z
+.scorecardresearch.com	TRUE	/	TRUE	1825496667	UID	10F6359ffb0860be84b70fb1791800274
+.scorecardresearch.com	TRUE	/	TRUE	1825496667	XID	10F6359ffb0860be84b70fb1791800274
+.bing.com	TRUE	/	TRUE	1825496277	MUID	1092B68E97166CF615C9A17E96DB6DDD
+.c.bing.com	TRUE	/	TRUE	1792405077	MR	0
+.c.bing.com	TRUE	/	TRUE	1825496277	SRM_B	1092B68E97166CF615C9A17E96DB6DDD
+.c.bing.com	TRUE	/	TRUE	1825496277	SRM_M	1092B68E97166CF615C9A17E96DB6DDD
+.c.msn.com	TRUE	/	TRUE	1825496278	SRM_M	1092B68E97166CF615C9A17E96DB6DDD
+.c.msn.com	TRUE	/	TRUE	1792405078	MR	0
+.microsoft.com	TRUE	/	TRUE	1791886783	MSCC	NR
+.google.com	TRUE	/	TRUE	1823336646	__Secure-1PSIDTS	sidts-CjEBkldj_wcsOwIPZvTqiG2YJSwb_7BsLx2KlnATDaZs0EKbcIDmJsSAoQMh9DpnpfaWEAA
+.google.com	TRUE	/	TRUE	1823336646	__Secure-3PSIDTS	sidts-CjEBkldj_wcsOwIPZvTqiG2YJSwb_7BsLx2KlnATDaZs0EKbcIDmJsSAoQMh9DpnpfaWEAA
+.yandex.ru	TRUE	/	TRUE	1826360699	pcuid_context	9633749101791800696
+.facebook.com	TRUE	/	TRUE	1826360799	datr	1rXMai042WcrHBNf3YKWXZmk
+.facebook.com	TRUE	/	TRUE	1826361577	sb	1rXMar7Lt_nL3PQLhE_hbNxY
+.facebook.com	TRUE	/	TRUE	1792406392	wd	1592x776
+.facebook.com	TRUE	/	TRUE	1792405669	locale	ru_RU
+.yandex.ru	TRUE	/	TRUE	1793010498	cycada	NH7yqIFyBZxgLhPq9LcoZ6WrsH9IvU2pP4NCnPPnpXI=
+.msn.com	TRUE	/	TRUE	1799577614	msnup	%7B%22cnex%22%3A%22no%22%7D
+.msn.com	TRUE	/	TRUE	1825496917	MUIDB	1092B68E97166CF615C9A17E96DB6DDD
+.yandex.ru	TRUE	/	TRUE	1826360922	is_gdpr	1
+.yandex.ru	TRUE	/	TRUE	1826360922	is_gdpr_b	CL7bERCNoQMYAQ==
+.yandex.ru	TRUE	/	TRUE	1826360929	_yasc	VZlq0azwAYpowpgh9T/VwYOy0DMyDYXimc/XvbHcbV4MbBKd+aYTI63ZgLS0r+AGum/Cs73NvE0/kstml2WzeHmk0UOucFpqG1yMhfWfdafdA/LklLarokA=
+.google.com	TRUE	/	TRUE	1825967996	__Secure-ENID	CqACCAIS0gEBAQxeReJGlasekdit8IwK302C982Rwg67f7vzzE6GrGbOTG5giJm5LrvJO6ySDsStWG5Q-25bMYyKuXLO7XuC2VkfjBWY1Gbt5wKueR_Fzwi3JI2BWNknVupOYu9KnFM1JzuHgAadRMFzmWArjZC27JnilMOnyII6VPQa116n44TIpo3rys-ryMWEq7HcQtM_sJJkbs7Fum43mX00VCf2Oq6GMfzNhKR_Jc4mAC4tXFIMDEdrvb97IajKYPAQ4BXzVnbScu7a8ZPT83PrCUcU34YoAjJFAX1sxKp3m2l3acjIR494AeIhWb2Z4dAPx7VKHlMh3OVuF_aRkdUVugm8_Y5MbRF2hQP0dAz4I0zg0Jn4I5LZ2jjFjZsO
+.google.com	TRUE	/	TRUE	1807592853	NID	CvcCCAESqQIBOxGDSIM9woz3ZzumcL_tlp8S5P03-kwtmkh9RPDyZX9xHsaMxyJworDKnFmm-PzBIz7KBFo7GHkYPcwv8vHYmxA_zJYeAIaCemTCuiOF7hI32Vv8BZnksp5uqyeoPd8WoOSmyLF4aNewqDJ43ofd3gKR-mbSwarg8f-m1jpSvrL6n_Z2GXy-yVv7YQgdvDtrWEtCb11__HpfoahKkML2q3LnlGlfe4yh7W4MwUd2g9VJix_0LDiPoUeklZuO_GYSPKvXsVcMbKFgBbluioPllf5AneChzhjrZQjGTsiOxtbf2X9wA3YlwFV1JcZ4kexplREiDrXrAsjjAk6SjvYCTCLKYfV-I4W5TmlelsSHVmMN5bcib0zUOD9dGqc651R5SBMfFiO3St0oATJFAdKsB89EiGR7N2jGpKGAKkKTAnY5zbb-jXbS7sqnfqyCbKJ3I0IOoMO3wWrbswKwO0Xwuk1gFqKlAd4ekW_X_InmsgYF
+.google.com	TRUE	/	FALSE	1826361569	SID	g.a000DgnEQTKq0uZW0GTrLDRKq-Q8yFpe46uHd7j16YnODEaP0GWNO8eREhUHWE4SnuW5Y3XlSQACgYKAQ8SARQSFQHGX2MiajmmeBVBa801WWBV6Aa5AxoVAUF8yKopdrsVNIk1TpRYUf_beC_30076
+.google.com	TRUE	/	TRUE	1826361569	__Secure-1PSID	g.a000DgnEQTKq0uZW0GTrLDRKq-Q8yFpe46uHd7j16YnODEaP0GWNt8Z5Z8pobCyCsSQR8IGQowACgYKAdQSARQSFQHGX2MinYKlEAbOtZa8UhNHqxMWvhoVAUF8yKqFZqdH8xomBgLx099jb7nC0076
+.google.com	TRUE	/	TRUE	1826361569	__Secure-3PSID	g.a000DgnEQTKq0uZW0GTrLDRKq-Q8yFpe46uHd7j16YnODEaP0GWNUBsst-6mTfXfiH1kj7zobQACgYKAUoSARQSFQHGX2MiroBPzmJ2mHKwghIMz0_6jhoVAUF8yKpkjSL_HlokOEBx6YOGa3p20076
+accounts.google.com	FALSE	/	TRUE	1826361569	LSID	o.chromewebstore.google.com|o.myaccount.google.com|s.FR|s.RU|s.youtube:g.a000DgnEQcEFghZs2UbdgohpjOsKjz2cSRd8COYSRecUreCak9O6ez8nyu7siARJyDQrugzGhQACgYKAcgSARQSFQHGX2Mi0XLb3ClPCXlz46HLitiYzxoVAUF8yKoSR8eKa_DIt7fn-WeDysmK0076
+accounts.google.com	FALSE	/	TRUE	1826361569	__Host-1PLSID	o.chromewebstore.google.com|o.myaccount.google.com|s.FR|s.RU|s.youtube:g.a000DgnEQcEFghZs2UbdgohpjOsKjz2cSRd8COYSRecUreCak9O6-coD7KgmfPOGl3om_VTTAwACgYKAQoSARQSFQHGX2MiKHKewJdD5iCkccOaNMZ6RRoVAUF8yKrxAeZ6IEtcyRVWNh7yrm4D0076
+accounts.google.com	FALSE	/	TRUE	1826361569	__Host-3PLSID	o.chromewebstore.google.com|o.myaccount.google.com|s.FR|s.RU|s.youtube:g.a000DgnEQcEFghZs2UbdgohpjOsKjz2cSRd8COYSRecUreCak9O6JcgCP-0v_p644BhoPoBuegACgYKAVsSARQSFQHGX2MiKCY25Pa7yGjRQCz9ThToGxoVAUF8yKphdr7quYniVmZWs4P-1UPq0076
+.google.com	TRUE	/	FALSE	1826361569	HSID	AcQKogMgZ9SN5hxrS
+.google.com	TRUE	/	TRUE	1826361569	SSID	A2tccGUAWwnVO5QYm
+.google.com	TRUE	/	FALSE	1826361569	APISID	F80c06n9I93nhGtw/AEqsAfQ_2sE46iW6E
+.google.com	TRUE	/	TRUE	1826361569	SAPISID	AkyVdxbtFe8UGEfC/AAm8DNXi3OV6JZQtl
+.google.com	TRUE	/	TRUE	1826361569	__Secure-1PAPISID	AkyVdxbtFe8UGEfC/AAm8DNXi3OV6JZQtl
+.google.com	TRUE	/	TRUE	1826361569	__Secure-3PAPISID	AkyVdxbtFe8UGEfC/AAm8DNXi3OV6JZQtl
+accounts.google.com	FALSE	/	TRUE	1826361569	ACCOUNT_CHOOSER	AFx_qI6ZvVjht_1OXeS8klzmWK5RnwuIgIC4LjS6m8uZZfR6IPSSOMacps60fdOhZ8CwrwFupG8wx61pKY6Mid0_mB7eC93fMTVPTVHfCIuAjq0mtynPUR-40blGf-S-tWDFekQqgUYuNbGYiDIcmMQu2Tk63ASV53XevUfOovkuk42pYoxfc9L9gIQXLpHK2sdKipSjr6GPSDkyeMuEvHOe7HkmfV131oVyLtcGaRz0RyHakLNt0Oo
+accounts.google.com	FALSE	/	TRUE	1826361569	__Host-GAPS	1:3YllPDGVGDW68E8bQpoZNlyTsLJm9_G5GuEj237RSWpffUh7tSZht9u4MZybBkpVCgu-E27t3D4O5xzJ4KGRlSHimJ78Iw:mOjjB2w-SLExzQn6
+accounts.google.com	FALSE	/	TRUE	1826361569	SMSV	ADHTe-CdkneiuWW_VIbXTtos4qjsoK0XVcZvAR0ckreIqtULJFSVpaH5tCREucj0t9LzfhYOGZGpEOPD9BtOq_LB8Y1Hy3r_-6tp9fQhZ5TTxvzq0IbNDp4
+.youtube.com	TRUE	/	FALSE	1826361569	SID	g.a000DgnEQTKq0uZW0GTrLDRKq-Q8yFpe46uHd7j16YnODEaP0GWNO8eREhUHWE4SnuW5Y3XlSQACgYKAQ8SARQSFQHGX2MiajmmeBVBa801WWBV6Aa5AxoVAUF8yKopdrsVNIk1TpRYUf_beC_30076
+.youtube.com	TRUE	/	TRUE	1823337569	__Secure-1PSIDTS	sidts-CjQBkldj_xSGAzcnm8kl5uPc-cW6OHYwXXblvVHs6S86_M8BmDijQaWMgJLf3bWiGPvZVQ0kEAA
+.youtube.com	TRUE	/	TRUE	1823337569	__Secure-3PSIDTS	sidts-CjQBkldj_xSGAzcnm8kl5uPc-cW6OHYwXXblvVHs6S86_M8BmDijQaWMgJLf3bWiGPvZVQ0kEAA
+.youtube.com	TRUE	/	TRUE	1826361569	__Secure-1PSID	g.a000DgnEQTKq0uZW0GTrLDRKq-Q8yFpe46uHd7j16YnODEaP0GWNt8Z5Z8pobCyCsSQR8IGQowACgYKAdQSARQSFQHGX2MinYKlEAbOtZa8UhNHqxMWvhoVAUF8yKqFZqdH8xomBgLx099jb7nC0076
+.youtube.com	TRUE	/	TRUE	1826361569	__Secure-3PSID	g.a000DgnEQTKq0uZW0GTrLDRKq-Q8yFpe46uHd7j16YnODEaP0GWNUBsst-6mTfXfiH1kj7zobQACgYKAUoSARQSFQHGX2MiroBPzmJ2mHKwghIMz0_6jhoVAUF8yKpkjSL_HlokOEBx6YOGa3p20076
+.youtube.com	TRUE	/	FALSE	1826361569	HSID	AZqZFcuLc9UMdy1hl
+.youtube.com	TRUE	/	TRUE	1826361569	SSID	AWPhVHLCcM0sTvVLD
+.youtube.com	TRUE	/	FALSE	1826361569	APISID	F80c06n9I93nhGtw/AEqsAfQ_2sE46iW6E
+.youtube.com	TRUE	/	TRUE	1826361569	SAPISID	AkyVdxbtFe8UGEfC/AAm8DNXi3OV6JZQtl
+.youtube.com	TRUE	/	TRUE	1826361569	__Secure-1PAPISID	AkyVdxbtFe8UGEfC/AAm8DNXi3OV6JZQtl
+.youtube.com	TRUE	/	TRUE	1826361569	__Secure-3PAPISID	AkyVdxbtFe8UGEfC/AAm8DNXi3OV6JZQtl
+.google.fr	TRUE	/	FALSE	1826361570	SID	g.a000DgnEQTKq0uZW0GTrLDRKq-Q8yFpe46uHd7j16YnODEaP0GWNO8eREhUHWE4SnuW5Y3XlSQACgYKAQ8SARQSFQHGX2MiajmmeBVBa801WWBV6Aa5AxoVAUF8yKopdrsVNIk1TpRYUf_beC_30076
+.google.fr	TRUE	/	TRUE	1826361570	__Secure-1PSID	g.a000DgnEQTKq0uZW0GTrLDRKq-Q8yFpe46uHd7j16YnODEaP0GWNt8Z5Z8pobCyCsSQR8IGQowACgYKAdQSARQSFQHGX2MinYKlEAbOtZa8UhNHqxMWvhoVAUF8yKqFZqdH8xomBgLx099jb7nC0076
+.google.fr	TRUE	/	TRUE	1826361570	__Secure-3PSID	g.a000DgnEQTKq0uZW0GTrLDRKq-Q8yFpe46uHd7j16YnODEaP0GWNUBsst-6mTfXfiH1kj7zobQACgYKAUoSARQSFQHGX2MiroBPzmJ2mHKwghIMz0_6jhoVAUF8yKpkjSL_HlokOEBx6YOGa3p20076
+.google.fr	TRUE	/	FALSE	1826361570	HSID	AZqZFcuLc9UMdy1hl
+.google.fr	TRUE	/	TRUE	1826361570	SSID	AWPhVHLCcM0sTvVLD
+.google.fr	TRUE	/	FALSE	1826361570	APISID	F80c06n9I93nhGtw/AEqsAfQ_2sE46iW6E
+.google.fr	TRUE	/	TRUE	1826361570	SAPISID	AkyVdxbtFe8UGEfC/AAm8DNXi3OV6JZQtl
+.google.fr	TRUE	/	TRUE	1826361570	__Secure-1PAPISID	AkyVdxbtFe8UGEfC/AAm8DNXi3OV6JZQtl
+.google.fr	TRUE	/	TRUE	1826361570	__Secure-3PAPISID	AkyVdxbtFe8UGEfC/AAm8DNXi3OV6JZQtl
+.google.fr	TRUE	/	TRUE	1807592537	NID	Cu4CCAESoAIBOxGDSNptEkhDwN4S5W_kL8nux7tdXF78abSAn4lq2QlKOzhoNgIqVlP2LtwyEGxJvfoB_Qdh9xcOV7b8ElZYcPT_849fVZBB9awuw2bsTlBGupm477TGlzPgCCIXS2eV_QiYXOAT1mRV4ZEcWsE51teMy8K-fuRHqGdDsBpYdEfZRdAmJHK0VmUhMQHXMa6jQAaHBFrHgyzig7J8q0lbaMsZZMLlXg2UmVNu4dumNT7aWZa0GpB7-6ovqArCJLRf57IC05c2aoVh0Dq1V9X8qI5NC2dvaex2G4MM6Z0YFZUIsN7wRyAXOXkKxEqcEpjQEDWu5bSX2EIeqAZzRFafM4XrpTFM6JNBkmnJ5CoIhzMvWW5wrE5GPavCq37eHC4oATJFAdKsB88kUaL11LcFl_k5hJOhMmz7zuymVch1_evkpzeXbULp1bH4uB57T2Hgi0mikf6Ha5SIq-kq2mlB4o1eCpdGSeYH
+.google.ru	TRUE	/	FALSE	1826361571	SID	g.a000DgnEQTKq0uZW0GTrLDRKq-Q8yFpe46uHd7j16YnODEaP0GWNO8eREhUHWE4SnuW5Y3XlSQACgYKAQ8SARQSFQHGX2MiajmmeBVBa801WWBV6Aa5AxoVAUF8yKopdrsVNIk1TpRYUf_beC_30076
+.google.ru	TRUE	/	TRUE	1826361571	__Secure-1PSID	g.a000DgnEQTKq0uZW0GTrLDRKq-Q8yFpe46uHd7j16YnODEaP0GWNt8Z5Z8pobCyCsSQR8IGQowACgYKAdQSARQSFQHGX2MinYKlEAbOtZa8UhNHqxMWvhoVAUF8yKqFZqdH8xomBgLx099jb7nC0076
+.google.ru	TRUE	/	TRUE	1826361571	__Secure-3PSID	g.a000DgnEQTKq0uZW0GTrLDRKq-Q8yFpe46uHd7j16YnODEaP0GWNUBsst-6mTfXfiH1kj7zobQACgYKAUoSARQSFQHGX2MiroBPzmJ2mHKwghIMz0_6jhoVAUF8yKpkjSL_HlokOEBx6YOGa3p20076
+.google.ru	TRUE	/	FALSE	1826361571	HSID	AZqZFcuLc9UMdy1hl
+.google.ru	TRUE	/	TRUE	1826361571	SSID	AWPhVHLCcM0sTvVLD
+.google.ru	TRUE	/	FALSE	1826361571	APISID	F80c06n9I93nhGtw/AEqsAfQ_2sE46iW6E
+.google.ru	TRUE	/	TRUE	1826361571	SAPISID	AkyVdxbtFe8UGEfC/AAm8DNXi3OV6JZQtl
+.google.ru	TRUE	/	TRUE	1826361571	__Secure-1PAPISID	AkyVdxbtFe8UGEfC/AAm8DNXi3OV6JZQtl
+.google.ru	TRUE	/	TRUE	1826361571	__Secure-3PAPISID	AkyVdxbtFe8UGEfC/AAm8DNXi3OV6JZQtl
+.google.ru	TRUE	/	TRUE	1807592538	NID	Cu0CCAESnwIBOxGDSHLLlFN-sxCNELjro3s1ajfXLeV9G44r1vuhFXmZjp3Uj0opVwzOJQJ4SQBcfEoXGBMxB2noZWj08YVdmT4SSJs8aZwRlUsKJU_5dfn16Rsqtw_Lp4jvztMvxwvhiliCfxYgdyEjFOryw4opOpZ9gFgw42VGWofNAiDtre9lDKhIY85NEZ4s7I8nXZ0yoJz9GGioeKx_0l-B8ocjSicln85rOnARxo1alBEP4x237MoxTK_6ixEjAY2cUTF13OxU7IBcUDwfZ5ZrtRvHpnGIcKlhyISP2-Sg58j7EuZg_L-HR52dVKZija6nK1yL5KmTOPuEQi7VY6fBYmGjTpIZozz9krELi0XR0JAtECMpFqaJca7F-nv7D5gKzygBMkUB0qwHzyxgFw1cyKKNgr997essjvkedPkP4iayQOXg2vARGgKYMI1otWUzpTv11J49EGe-M8VZAas2aTLRfpup_NBHego
+.google.com	TRUE	/	FALSE	1823337572	SIDCC	AKEyXzUkwT4Um7D1UPLL1sErw88t-gBAe2s3z6LhIdO6FrIkNZajJpXN9tTEqXdpeWu8O2pZ
+.google.com	TRUE	/	TRUE	1823337572	__Secure-1PSIDCC	AKEyXzV9d1qlmveoTewilE8CBcaElgVqJGuEQLiYwiGVSeTv33_gfPTeoch_F6S6lV2LPJybKg
+.google.com	TRUE	/	TRUE	1823337572	__Secure-3PSIDCC	AKEyXzWBpkd_zbUuG99RGo20KG_xRAhZPmY6Bxjf4fc03CX1AEanKgsFCikuwe6imCXh2McK
+.facebook.com	TRUE	/	TRUE	1823337590	c_user	100010271560418
+.facebook.com	TRUE	/	TRUE	1799577578	fr	0icG2WJ9STV17pC3z.AWdAD1RIUZuMO8lk9jrh1Z5qAa63c216EA1Pu6iuvifZQ06weTo.BqzLjn..AAA.0.0.BqzLjn.AWdSbkP4vvaGhp4g672D_sjTxWQ
+.facebook.com	TRUE	/	TRUE	1823337590	xs	18%3AIy7QRlVbLFystA%3A2%3A1791801571%3A-1%3A-1%3A%3AAcxCXD8OP9OAcNWQZnnk18EEyURVhshL4Y1zKYuzVw
+.facebook.com	TRUE	/	TRUE	0	presence	C%7B%22t3%22%3A%5B%5D%2C%22utc3%22%3A1791801593449%2C%22v%22%3A1%7D
+.c.msn.com	TRUE	/	TRUE	0	SM	C
+.yandex.ru	TRUE	/	TRUE	1826361616	yp	2107141421.udn.cDpwaXJuZXI0NDQ0#2107161616.pcs.0#1792645443.dlp.1#1794373443.gph.225_124#1792386244.szm.1%3A1600x900%3A1576x776%3A15#1791822299.iapfr.1#1794479117.hdrc.0
+.yandex.ru	TRUE	/	TRUE	1826361615	bh	EkIiTWljcm9zb2Z0IEVkZ2UiO3Y9IjE1NSIsICJDaHJvbWl1bSI7dj0iMTU1IiwgIk5vdChBOkJyYW5kIjt2PSIyNCIaBSJ4ODYiIg8iMTU1LjAuNDI4My40NSIqAj8wMgIiIjoJIldpbmRvd3MiQggiMTAuMC4wIkoEIjY0IlJcIk1pY3Jvc29mdCBFZGdlIjt2PSIxNTUuMC40MjgzLjQ1IiwgIkNocm9taXVtIjt2PSIxNTUuMC44MDU5LjQwIiwgIk5vdChBOkJyYW5kIjt2PSIyNC4wLjAuMCJaAj8wYI/ystYGaiHcyuH/CJLYobEDn8/h6gP7+vDnDev//fYPobXNhwiAwQM=
+web.archive.org	FALSE	/	FALSE	0	wb-p-SERVER	wwwb-app204
+.archive.org	TRUE	/	FALSE	1823337623	donation-identifier	815838f62a2ae21a21ac6bde5b37d315
+web.archive.org	FALSE	/	FALSE	0	wb-cdx-ui-SERVER	wwwb-app205
+.yandex.ru	TRUE	/	TRUE	0	ys	udn.cDpwaXJuZXI0NDQ0#wprid.1791801613628601-8748935703776976062-balancer-l7leveler-kubr-yp-nrg-139-BAL#c_chck.1768481122
+
+# Netscape HTTP Cookie File
+# https://curl.haxx.se/rfc/cookie_spec.html
+# This is a generated file! Do not edit.
+
+www.googleadservices.com	FALSE	/pagead/conversion/335796524/	TRUE	1799496975	Conversion	EgwIABUAAAAAHQAAAAAYASCi4uPlr7aO1z1IAWpbQ2p3S0NBanc1NnpXQmhCMEVpd0FkUE9RT1pjVWM2NTU5ODdwek8za1IyN20zWlpsMWFqVmpZNzU3cWVxUlc4Z3M2UGlkY0hwRERVZzV4b0Mzb0lRQXZEX0J3RXCCtfbh-LGXA5AB9vjF3bkWmAEE
+www.google.com	FALSE	/recaptcha	TRUE	1807193661	_GRECAPTCHA	09AKhCRwgU0Tc7Y1jQgIUTLYub_W9QtrzssNQZZKN7T3R_uSFAcD1iu1TM7EEAqt1f_-JooqRHDgMp_FII77ub3X4
+ntp.msn.com	FALSE	/edge	FALSE	1796823397	__rubyUX	false
+.msn.com	TRUE	/edge	FALSE	1807504086	pglt-edgeChromium-ntp	2339
+.yandex.ru	TRUE	/	TRUE	1825852756	is_gdpr	1
+.yandex.ru	TRUE	/	TRUE	1825852756	is_gdpr_b	CL7bERCAoAMYAQ==
+.yandex.ru	TRUE	/	TRUE	1825852756	i	HyjBuQL9O5ZFm5vmoPj1Rqo9/y16n/6cXMUn+jjMXCH6aHXi88HwQYMeAwww0GPgmahOfdkdlAVpQztMnJMTktTf47A=
+.yandex.ru	TRUE	/	TRUE	1823178394	yandexuid	1201934391791292755
+.dzen.ru	TRUE	/	TRUE	1825852756	zencookie	4465667271791292755
+.dzen.ru	TRUE	/	TRUE	1792502358	zen_sso_checked	1
+.dzen.ru	TRUE	/	TRUE	1822828758	yandex_login	
+.dzen.ru	TRUE	/	TRUE	1825852758	yandexuid	1201934391791292755
+.dzen.ru	TRUE	/	TRUE	1825852758	mda2_beacon	1791292756418
+.dzen.ru	TRUE	/	TRUE	1792502358	zen_vk_sso_checked	1
+.vk.com	TRUE	/	TRUE	1822828759	remixstid	1354209989_7oLa4dQWGoxPTkButM91Dw2IzFdSyKIzbMCUiOtzwR0
+.vk.com	TRUE	/	TRUE	1822828759	remixstlid	9072187078429869927_bPkPSuuEfgupc4tuZwviO2T7vBErWRFndVHroWMfhG4
+.dzen.ru	TRUE	/	FALSE	1823315259	Zen-User-Data	{%22zen-theme%22:%22light%22%2C%22zen-theme-setting%22:%22light%22}
+.dzen.ru	TRUE	/	TRUE	1822828761	_ym_uid	1791292762724969328
+.dzen.ru	TRUE	/	TRUE	1822828761	_ym_d	1791292762
+.dzen.ru	TRUE	/	FALSE	1806844762	compliance-alert	true
+.dzen.ru	TRUE	/	FALSE	1825852762	zen_gid	10502
+.dzen.ru	TRUE	/	FALSE	1825852762	zen_vk_gid	2249
+.dzen.ru	TRUE	/	FALSE	1825852762	zen_extra_gid	
+.dzen.ru	TRUE	/	FALSE	1825852762	zen_extra_vk_gid	
+.vk.ru	TRUE	/	TRUE	1822880725	remixlang	0
+.vk.ru	TRUE	/	TRUE	1822828763	remixstlid	9072046340945964607_rozcnfy8p984zfzziGjsZFWzKPPdpTK1zIDMhvu5KSg
+.vk.ru	TRUE	/	TRUE	1823408080	remixuas	YzJkNTI0NGE5MjU2YTQ2YjVlOTAzMzIw
+.dzen.ru	TRUE	/	FALSE	1820550458	tmr_lvid	75f07f27b11f79e7a01e669d09af4592
+.dzen.ru	TRUE	/	FALSE	1820550458	tmr_lvidTS	1791292764476
+.bing.com	TRUE	/	TRUE	1825336094	MUID	123C1E9391A065CB3E1B097990756440
+www.bing.com	FALSE	/	FALSE	1825498311	MUIDB	123C1E9391A065CB3E1B097990756440
+.bing.com	TRUE	/	FALSE	1824988774	_EDGE_V	1
+.bing.com	TRUE	/	TRUE	1824988774	SRCHD	AF=NOFORM
+.bing.com	TRUE	/	TRUE	1824988774	SRCHUID	V=2&GUID=7B921DAC630C42D48A52EEC9BD0FD2BC&dmnchg=1
+.bing.com	TRUE	/	TRUE	1807527111	ANON	A=5158A609841166B2981CC7BDFFFFFFFF
+.msn.com	TRUE	/	TRUE	1792407110	elt	%7B%22access_token%22%3A%22eyJhbGciOiJkaXIiLCJlbmMiOiJBMjU2Q0JDLUhTNTEyIiwia2lkIjoiLU9iNWZiZGE4aFduTmJpX2hjaWpWZzE4cFBCRGRFWXZWT3FCNjNYdjJBUSIsInppcCI6IkRFRiJ9..X-s-Cdm4z4dT09r3O_194g.Dma2GaYVaQpGLehZqcs_ZZBMWpuho7NKb_JtU9U1nKZWdaV47TfQy9o1E-KGQlaz5tZ1sWmL3hUFstIKK5goiHeQcbVVHS42XPZhq5BIuds244emolMwYmxCke5GK5yq4gIPMCmirob0hSfu4cVbre8FOmOYTcc0rm7275Dk4TJ6mPCWeQkYx5MG-UprfHLVeS9emgn_rKOydb0DlO1zuFUB4IEQTeGX38jLJBF5U_tUPipxDKc2lOf3bUJQbWzvD0_ewS9IDKZ7Ibx5traSzKzGruudda5qbf4DhjZ43geEtjtp8Weo4a8F3KLDRs0zHOmlbHAIJq6Q5IHS7VCvIwKylOYsmTgsUhGL0FGVKvpsjZSJ6tDFay7zlJ1assgEF8GjNSOUbWKK05Mp5wHyCniNZzIgwGYFHFucj6gG5PCsQgZznIirhNfarp9hCkAO3GPwjHmEonyTbDuJuzfd-6rz6sQPyRSdHpJmtOKyUBxZPcEhkTTOc6juZL4nBPUfJ4Apm1y87RZnCN1Yuk1MnpapfeI02M-y7Ef6_-9APB4LfyCika0oa0EyIUX784PmPcacaRuucFuDjU7mXqcgF4KbWSxiVNYhLHyRWka9aAamCGMFha_NU3CoT--CSYRxSOMFyIpAFB_GhAzt2sk8ev-TYj-dDZvO-BHtPWUscX2MF5krPCh56jtqIVM3Zd_WA4sg-v5cpbgLC9bo_5s2yG8rE4Qk5MiEDo6PspTqm9dSQi2hpcJlUfX91CjoCeIHnjs8YyrajXNPbEjanb0RD979vmnbzbBoULEQI1N_yDMJ0f8iFMQHWx0RH2yWH0Vxf0OQIPp3dSmB6m8mT73enEXBlmLw-srIz5je4NoUokhsfcXXeF2C7GrTTRRtfU0rxqGVS6-v62Je7gMepdV0cP8IldNl0hglUYsNNn77BMJCeKfPvKubCPaQ9u35Ia6oB_olDdTQe2rinOvtBcZL2oWXL_xHf3Q8QjSPWX4Y91VzwN2qicogZt8HMfJaJEBhcJ4-EILwjjinEE9DFEsDJQNpzhUyI706ncu9zLJkurTv3TTAZ2tj3q3IM8iEWaWnXyPU64AIoY7sL1fCh99VAQfipoDWkxPcljE8jtQ89yeTU8SryvJeczjqZv1O4fHl85L1zY4Rzkf6hF74VKiWuQmF8_slyda6VB-6o7sXhnCpMYVRkw0pLH-bgaMiiwQwVwZUJs6enrSuUsQ_hCLe9QqcdZgyVQFsalayilepNZ2D8PmlNgJjqg9yHwE0gXT4xkIEc0FczShdCthpnaFM_tpHAo8BeSLs2Y0GMmK9VaBvv2OD4PE-gKe9khwhZXMuR9mmivXhlXHxzFiSEJNlCCNvRaTBI5tiMibY8sNGy1MOIV89u3ZfD-iiw1g_1Z89IJGNZcjLPn_uRABBcz15txTofj-GwUOlsJCY3RU_nic.ENEWbmSXSWRQfMuwZQeuhV3wJNVxLnefCmpugt56n_g%22%2C%22account_type%22%3A%22MSA%22%2C%22login_hint%22%3A%22M$Ejx4nOO4vOz9_vNvr8yoEZItyCwqrUrMSy0qziyuTMwztLQwcEjPTczM0UvOz5W4dPfKkl__gYARAJ_hGjk%22%2C%22e%22%3A%2250e5ecb9%22%7D
+.msn.com	TRUE	/	TRUE	1792407110	eltc	%7B%22account_type%22%3A%22MSA%22%2C%22e%22%3A%2250e5ecb9%22%7D
+.google.com	TRUE	/	TRUE	1825420993	SOCS	CAAaBgiA9JDWBg
+consent.google.com	FALSE	/	TRUE	1793884994	OTZ	8816483_28_32_123600_28_436080
+accounts.google.com	FALSE	/	TRUE	1793884998	OTZ	8816483_28_32_123600_28_436080
+myaccount.google.com	FALSE	/	TRUE	1825853323	OSID	g.a000DQl_0g_6EfvX0008rZFWQhpmJlWt1MHJYT7TLlylKEUNaagZW0wJkGkkhf_qsEIQ7NLA2wACgYKAeMSARQSFQHGX2MijS30wH-vdXiXZ1llEIGTkRoVAUF8yKpjAXQ4aKDtDHPMKfRXZcfE0076
+myaccount.google.com	FALSE	/	TRUE	1825853323	__Secure-OSID	g.a000DQl_0g_6EfvX0008rZFWQhpmJlWt1MHJYT7TLlylKEUNaagZ8g7hNdnW4jV7iN9qCqVPzQACgYKAS0SARQSFQHGX2MiW4xqwSwCfLx19aX2JzbRiBoVAUF8yKqCtqcBN7V0klLEzJFBcn0z0076
+myaccount.google.com	FALSE	/	TRUE	1793885327	OTZ	8816489_28_32_123600_28_436080
+ogs.google.com	FALSE	/	TRUE	1793885343	OTZ	8816489_28_32_123600_28_436080
+.bing.com	TRUE	/	TRUE	1825923833	SRCHUSR	DOB=20261006&DS=1
+.instagram.com	TRUE	/	TRUE	1826198304	datr	HzvKajbPEEMVUz4S-o-14nnc
+.instagram.com	TRUE	/	TRUE	1823174304	ig_did	A6B07524-7701-4AEE-9048-23E5DB106995
+.instagram.com	TRUE	/	TRUE	1826198304	mid	aso7HwALAAGK2ynaFhcMQg8v7UpC
+.facebook.com	TRUE	/	TRUE	1826198317	datr	LDvKasJWa-zv9mIvv0KUT3UP
+.facebook.com	TRUE	/	TRUE	1826334659	sb	LDvKasB8QQOk8gmuyxAVj5Np
+.instagram.com	TRUE	/	TRUE	1826362407	csrftoken	SQVfYYGN4lVhG5JvTX2dcZ9pUC49DRlW
+.instagram.com	TRUE	/	TRUE	1799578407	ds_user_id	64880769641
+.dzen.ru	TRUE	/	FALSE	1791865659	is_auth_through_phone	true
+.dzen.ru	TRUE	/	FALSE	1791865659	is_online_stat	false
+.dzen.ru	TRUE	/	FALSE	1822743276	stable_city	1
+.dzen.ru	TRUE	/	FALSE	1791898476	has_stable_city	true
+.vk.ru	TRUE	/	TRUE	1822573512	remixstid	609376490_S4yDwzACTbyDdMbDxqAjaKUMdldVxrP7EawPOoqcbVX
+ntp.msn.com	FALSE	/	FALSE	1826199397	sptmarket	ru%7C%7Cfr%7Cfr-fr%7Cfr-fr%7Cfr%7C%7Creason%3DRevIP%3Afr%7Ccf%3D5%7CRefA%3D6aca3f64f33c41f0afd494aacd43102d.RefC%3D2026-10-10T13%3A36%3A36Z
+.msn.com	TRUE	/	TRUE	1826199397	USRLOC	CLOC=LAT=48.5829|LON=7.7437|A=50000|TS=261012042741|SRC=I&BID=MjYxMDEyMTEyNzQxX2RjMGYyNTFkOWY0YjMwNGM3ODNiM2MzNjlkM2MxOGE0YTNhYWZhMDhiYTM3MWVkNmU0ZGIzZGE3M2U4N2M2MzM=
+ntp.msn.com	FALSE	/	FALSE	1825335397	MUIDB	030A579B41406FAD089D407540066E26
+.msn.com	TRUE	/	FALSE	1825335397	_EDGE_V	1
+api.msn.com	FALSE	/	FALSE	1826199397	sptmarket	ru-ru%7C%7Cfr%7Cfr-fr%7Cfr-fr%7Cfr%7C%7Creason%3DRevIP%3Afr%7Ccf%3D5%7CRefA%3D6aca3f654fce4fdbbec262e82e0d102b.RefC%3D2026-10-10T13%3A36%3A37Z
+.msn.com	TRUE	/	TRUE	1807191398	APP_ANON	A=5158A609841166B2981CC7BDFFFFFFFF
+.msn.com	TRUE	/	TRUE	1807191398	aace	%7b%22child%22%3a0%2c%22expiredOn%22%3a%222027-04-08T13%3a36%3a37%22%7d
+.msn.com	TRUE	/	TRUE	1807191398	els	%7b%22account_type%22%3a%22MSA%22%7d
+api.msn.com	FALSE	/	FALSE	1825335398	MUIDB	030A579B41406FAD089D407540066E26
+.msn.com	TRUE	/	TRUE	1799555287	msnup	%7B%22cnex%22%3A%22no%22%7D
+.msn.com	TRUE	/	TRUE	1825335404	MUIDB	030A579B41406FAD089D407540066E26
+.ntp.msn.com	TRUE	/	FALSE	1823176093	sptmarket_restored	ru%7C%7Cfr%7Cfr-fr%7Cfr-fr%7Cfr%7C%7Creason%3DRevIP%3Afr%7Ccf%3D5%7CRefA%3D6aca3f64f33c41f0afd494aacd43102d.RefC%3D2026-10-10T13%3A36%3A36Z
+.c.bing.com	TRUE	/	TRUE	1792244894	MR	0
+.c.bing.com	TRUE	/	TRUE	1825336094	SRM_B	123C1E9391A065CB3E1B097990756440
+.c.bing.com	TRUE	/	TRUE	1825336094	SRM_M	123C1E9391A065CB3E1B097990756440
+.msn.com	TRUE	/	TRUE	1825336094	MUID	123C1E9391A065CB3E1B097990756440
+.c.msn.com	TRUE	/	TRUE	1825336094	SRM_M	123C1E9391A065CB3E1B097990756440
+.c.msn.com	TRUE	/	TRUE	1792244894	MR	0
+.yandex.ru	TRUE	/	TRUE	1823178394	yuidss	1201934391791292755
+.youtube.com	TRUE	/	TRUE	1807192100	__Secure-BUCKET	CM8G
+.youtube.com	TRUE	/	TRUE	1826339269	PREF	tz=Asia.Novosibirsk&f4=10000
+passport.yandex.ru	FALSE	/	TRUE	1826202324	uniqueuid	0df3eccdb3fa4378932ce21d8c4b93541791642323
+.yandex.ru	TRUE	/	TRUE	1823315264	gdpr	0
+.yandex.ru	TRUE	/	TRUE	1823254908	_ym_uid	1791642325131526318
+.yandex.com	TRUE	/	TRUE	1826333373	yandexuid	1201934391791292755
+.yandex.com	TRUE	/	TRUE	1826333373	yuidss	1201934391791292755
+.yandex.com	TRUE	/	TRUE	1826333373	i	HyjBuQL9O5ZFm5vmoPj1Rqo9/y16n/6cXMUn+jjMXCH6aHXi88HwQYMeAwww0GPgmahOfdkdlAVpQztMnJMTktTf47A=
+.yandex.ru	TRUE	/	TRUE	1823178394	ymex	1823178394.yrts.1791642394
+.yandex.ru	TRUE	/	TRUE	1823178447	yandex_login	pirner4444
+.yandex.ru	TRUE	/	TRUE	1826202447	Session_id	3:1791642446.5.0.1791642445856:MjYmMw:5319.1.2:1|1773749552.-1.20002.2:1.3:1791642446|3:12246007.118896.pOLfopqcJNfXjGqXSWubt4jqyu4
+.yandex.ru	TRUE	/	TRUE	1826202447	sessar	1.2118107.CiA7IuvvkdF7G3jpx5UFq5cU0xLoRn5rcJaFMLJsXcyXJg.Puu65DxHXLJ4aPs9mZaIffXcuSi8ifA-l_UYC-3IA14
+.yandex.ru	TRUE	/	TRUE	1826202447	sessionid2	3:1791642446.5.0.1791642445856:MjYmMw:5319.1.2:1|1773749552.-1.20002.2:1.3:1791642446|3:12246007.118896.fakesign0000000000000000000
+.passport.yandex.ru	TRUE	/	TRUE	1826202447	sessguard	1.1791642446.1791642445856:MjYmMw:5319..3.500:2246103.O36IFKWl.Y43jdHJNfC8mIIakawYB-XpdB7Y
+.yandex.ru	TRUE	/	FALSE	1826202447	L	UwkDQllSBndGB3BbXWdjW3BOXAEMcw5sOgA+BgkZWAB/BA==.1791642446.2234944.35458.fa271369e099d51e5dccad9e3d525ec3
+.passport.yandex.ru	TRUE	/	TRUE	1826202447	lah	2:1854714446.12246037.mOTD-KnxGEl-aotT.VE4xpFzX1tRURfhQFg-aKm11xdOjoTx6lEjN.7I5eJrn2ws7S7Ho4YyJ0pw
+.passport.yandex.ru	TRUE	/	TRUE	1826202447	mda2_beacon	1791642446250
+.passport.yandex.ru	TRUE	/	TRUE	1826202454	mda2_domains	dzen.ru,ya.ru
+.ya.ru	TRUE	/	TRUE	1826202455	Session_id	3:1791642453.5.0.1791642445856:MjYmMw:5319.1.2:1|1773749552.-1.20002.2:1.3:1791642446|6:12246010.611695.8ZbrhqSoKh0Ia-0isH_hImIqq2g
+.ya.ru	TRUE	/	TRUE	1826202455	sessar	1.2118107.CiB2Umjf2MfFEzeZ2u0UfLp3HlVFbvsYiKBv3NJwS5Ubog.nbXdtSdsuwSdbzhDB3VIiggMgP4o7AnIh9iR0KYdAhk
+.ya.ru	TRUE	/	TRUE	1823178455	yandex_login	pirner4444
+.ya.ru	TRUE	/	TRUE	1826202455	yp	2107002453.udn.cDpwaXJuZXI0NDQ0
+.ya.ru	TRUE	/	TRUE	1826202455	i	HyjBuQL9O5ZFm5vmoPj1Rqo9/y16n/6cXMUn+jjMXCH6aHXi88HwQYMeAwww0GPgmahOfdkdlAVpQztMnJMTktTf47A=
+.ya.ru	TRUE	/	TRUE	1826202455	yandexuid	1201934391791292755
+.ya.ru	TRUE	/	FALSE	1826202455	L	UwkDQllSBndGB3BbXWdjW3BOXAEMcw5sOgA+BgkZWAB/BA==.1791642446.2234944.35458.fa271369e099d51e5dccad9e3d525ec3
+.ya.ru	TRUE	/	TRUE	1826202455	mda2_beacon	1791642453764
+.ya.ru	TRUE	/	TRUE	1826202455	_yasc	5HH+tmFMZwznAh+IyT9vn1hBHwJfMRSjSERiALsS8UzJxTw9v+CDOzPVDvajBfiLxAoq
+.google.com	TRUE	/	FALSE	1826202591	SID	g.a000Dgl_0nLlcLDOCZ9uh9ozkjhPvwKOj3rYJefKWUqE6VfIH1xVQURdZmuC1IiTrnJlXGyuBAACgYKAYwSARQSFQHGX2MioLpDMWTllUdJKXJCtXuOJBoVAUF8yKoXsNI4H9hzYbk137M9qvzm0076
+.google.com	TRUE	/	TRUE	1826202591	__Secure-1PSID	g.a000Dgl_0nLlcLDOCZ9uh9ozkjhPvwKOj3rYJefKWUqE6VfIH1xVKXYxQfIGFMaOwRxhkFjzAAACgYKAR4SARQSFQHGX2Miz4zOo2oMHLHLun13zHH9ZBoVAUF8yKq7PhboiObjqkVbRZuQuqnw0076
+.google.com	TRUE	/	TRUE	1826202591	__Secure-3PSID	g.a000Dgl_0nLlcLDOCZ9uh9ozkjhPvwKOj3rYJefKWUqE6VfIH1xVcXv-tIEoyBosco3rBBeRaQACgYKAeoSARQSFQHGX2MiUrGO77_FiAPU4ndEXie_KRoVAUF8yKqjLqQhYdn_YltmgRpcT2-00076
+.google.com	TRUE	/	FALSE	1826202591	HSID	AAyxw9HOwsdJYR-GS
+.google.com	TRUE	/	TRUE	1826202591	SSID	AtZIiHdBzNcI82gmz
+.google.com	TRUE	/	FALSE	1826202591	APISID	cbq1wv2kuJ5QtNkL/A4TfDmS6yHMZo5UB6
+.google.com	TRUE	/	TRUE	1826202591	SAPISID	XQxa1PIqrV_tr1OQ/AE3KXbZSTW6C9NLNE
+.google.com	TRUE	/	TRUE	1826202591	__Secure-1PAPISID	XQxa1PIqrV_tr1OQ/AE3KXbZSTW6C9NLNE
+.google.com	TRUE	/	TRUE	1826202591	__Secure-3PAPISID	XQxa1PIqrV_tr1OQ/AE3KXbZSTW6C9NLNE
+accounts.google.com	FALSE	/	TRUE	1826202591	SMSV	ADHTe-DiNPzofqn0JHouB6VtfhvtgbK_qtuHvh9Vfq_fv50d0HjEz4uxCPB_FUxn7JS0casy_AAyz2WzUgu1UJufz6GILMo4JNE0kn11TQCZs4hlAFM0Ac0
+accounts.google.com	FALSE	/	TRUE	1826202591	LSID	s.FR|s.youtube:g.a000Dgl_0jiEOjj1_jlxTEarniiSkPfFA_x2WjbvD9gaO_xm7FdlmfdzEp5m7KlfrO8_TxnjKAACgYKAUkSARQSFQHGX2MiP-PtBnLYXrIECP4NBcA5JBoVAUF8yKos6rN_Qlh0m88D6NkPlEJI0076
+accounts.google.com	FALSE	/	TRUE	1826202591	__Host-1PLSID	s.FR|s.youtube:g.a000Dgl_0jiEOjj1_jlxTEarniiSkPfFA_x2WjbvD9gaO_xm7FdlgwkQ2NtejevUvRXkD9Vd0gACgYKAfESARQSFQHGX2MiV_qLpUr4cV20MXUDDuTWMBoVAUF8yKrXiIhyJXaTrbwx99FZs3hP0076
+accounts.google.com	FALSE	/	TRUE	1826202591	__Host-3PLSID	s.FR|s.youtube:g.a000Dgl_0jiEOjj1_jlxTEarniiSkPfFA_x2WjbvD9gaO_xm7FdlMF4FRJJ3JYeOitlIuFa_dwACgYKAQASARQSFQHGX2MiXiArADSbjS1_vxW3KFkNHRoVAUF8yKqEz8y0OKl-S6OV9l5hNpN20076
+accounts.google.com	FALSE	/	TRUE	1826202591	ACCOUNT_CHOOSER	AFx_qI67EvocGgPg66jW3nk6RUHqX96joWNrmcXI8bXz-qSdQ0yqZNigJo5v4dHHycmCjQqOB3kgpRDaFN7BxxWWyqveVxHj_6PzfabCa8uHyOKbBJHY23V2AcbreIl9D6uAm8CbRviKwXz07veHM6d7C_noQD6K8w
+.youtube.com	TRUE	/	FALSE	1826202592	HSID	APElUt-8zdG_cCDoz
+.youtube.com	TRUE	/	TRUE	1826202592	SSID	AlICS8T_fF38Iwme6
+.youtube.com	TRUE	/	FALSE	1826202592	APISID	cbq1wv2kuJ5QtNkL/A4TfDmS6yHMZo5UB6
+.youtube.com	TRUE	/	TRUE	1826202592	SAPISID	XQxa1PIqrV_tr1OQ/AE3KXbZSTW6C9NLNE
+.youtube.com	TRUE	/	TRUE	1826202592	__Secure-1PAPISID	XQxa1PIqrV_tr1OQ/AE3KXbZSTW6C9NLNE
+.youtube.com	TRUE	/	TRUE	1826202592	__Secure-3PAPISID	XQxa1PIqrV_tr1OQ/AE3KXbZSTW6C9NLNE
+.youtube.com	TRUE	/	FALSE	1826202592	SID	g.a000Dgl_0nLlcLDOCZ9uh9ozkjhPvwKOj3rYJefKWUqE6VfIH1xVQURdZmuC1IiTrnJlXGyuBAACgYKAYwSARQSFQHGX2MioLpDMWTllUdJKXJCtXuOJBoVAUF8yKoXsNI4H9hzYbk137M9qvzm0076
+.youtube.com	TRUE	/	TRUE	1826202592	__Secure-1PSID	g.a000Dgl_0nLlcLDOCZ9uh9ozkjhPvwKOj3rYJefKWUqE6VfIH1xVKXYxQfIGFMaOwRxhkFjzAAACgYKAR4SARQSFQHGX2Miz4zOo2oMHLHLun13zHH9ZBoVAUF8yKq7PhboiObjqkVbRZuQuqnw0076
+.youtube.com	TRUE	/	TRUE	1826202592	__Secure-3PSID	g.a000Dgl_0nLlcLDOCZ9uh9ozkjhPvwKOj3rYJefKWUqE6VfIH1xVcXv-tIEoyBosco3rBBeRaQACgYKAeoSARQSFQHGX2MiUrGO77_FiAPU4ndEXie_KRoVAUF8yKqjLqQhYdn_YltmgRpcT2-00076
+.google.fr	TRUE	/	FALSE	1826202592	HSID	APElUt-8zdG_cCDoz
+.google.fr	TRUE	/	TRUE	1826202592	SSID	AlICS8T_fF38Iwme6
+.google.fr	TRUE	/	FALSE	1826202592	APISID	cbq1wv2kuJ5QtNkL/A4TfDmS6yHMZo5UB6
+.google.fr	TRUE	/	TRUE	1826202592	SAPISID	XQxa1PIqrV_tr1OQ/AE3KXbZSTW6C9NLNE
+.google.fr	TRUE	/	TRUE	1826202592	__Secure-1PAPISID	XQxa1PIqrV_tr1OQ/AE3KXbZSTW6C9NLNE
+.google.fr	TRUE	/	TRUE	1826202592	__Secure-3PAPISID	XQxa1PIqrV_tr1OQ/AE3KXbZSTW6C9NLNE
+.google.fr	TRUE	/	TRUE	1807453792	NID	CooCCAESvAEBOxGDSNGnIzP24ZBXSnOwRI_Z8AiYvzqVSB5z8ZnFQqiJbrPxdnO8HGasx4iL3dUxwKM-hew2Nu_aWg1myGXUiRpkMcYvbBAlDHhPIDDGlf2TCHUD3D7BgHS-5a5La2y7SM96B0gt96wsXPxw07LDi22XeEBNQjEcqTxTFBSob8qCtN7xt9SlaTPrE9pfUaqVIVmCZpkdDORI-dacdc0bi83WrMg9G-xwaHJzuBXY0dSazRF-njEwf2ztuigBMkUB0qwHz5XcS228e4CLVN_Y4h4r8wJpsbBMQ8Q_WKlw6eK33o6f0g9_KQf7Kp7DGns6HCq4lsYpdJQB9LI3HuBKP9R0HQs
+.google.fr	TRUE	/	FALSE	1826202592	SID	g.a000Dgl_0nLlcLDOCZ9uh9ozkjhPvwKOj3rYJefKWUqE6VfIH1xVQURdZmuC1IiTrnJlXGyuBAACgYKAYwSARQSFQHGX2MioLpDMWTllUdJKXJCtXuOJBoVAUF8yKoXsNI4H9hzYbk137M9qvzm0076
+.google.fr	TRUE	/	TRUE	1826202592	__Secure-1PSID	g.a000Dgl_0nLlcLDOCZ9uh9ozkjhPvwKOj3rYJefKWUqE6VfIH1xVKXYxQfIGFMaOwRxhkFjzAAACgYKAR4SARQSFQHGX2Miz4zOo2oMHLHLun13zHH9ZBoVAUF8yKq7PhboiObjqkVbRZuQuqnw0076
+.google.fr	TRUE	/	TRUE	1826202592	__Secure-3PSID	g.a000Dgl_0nLlcLDOCZ9uh9ozkjhPvwKOj3rYJefKWUqE6VfIH1xVcXv-tIEoyBosco3rBBeRaQACgYKAeoSARQSFQHGX2MiUrGO77_FiAPU4ndEXie_KRoVAUF8yKqjLqQhYdn_YltmgRpcT2-00076
+.bing.com	TRUE	/	TRUE	1826202646	USRLOC	HS=1&ELOC=LAT=50.688720703125|LON=3.184250831604004|N=%D0%A0%D1%83%D0%B1%D0%B5%2C%20%D0%9E-%D0%B4%D0%B5-%D0%A4%D1%80%D0%B0%D0%BD%D1%81|ELT=1|&CLOC=LAT=48.5829|LON=7.7437|A=50000|TS=261012042741|SRC=I&BID=MjYxMDEyMTEyNzQxX2RjMGYyNTFkOWY0YjMwNGM3ODNiM2MzNjlkM2MxOGE0YTNhYWZhMDhiYTM3MWVkNmU0ZGIzZGE3M2U4N2M2MzM=
+.login.live.com	TRUE	/	TRUE	1825338651	MSCC	51.38.54.50-FR
+.yandex.ru	TRUE	/	TRUE	1823254908	_ym_d	1791718908
+.softonic.ru	TRUE	/	TRUE	1793014915	_swo_pos	225
+.softonic.ru	TRUE	/	TRUE	1794310917	utm	medium=organic
+.softonic.ru	TRUE	/	FALSE	1823341316	didomi_token	eyJ1c2VyX2lkIjoiMWExMmFjNTAtMjVlZC02ZTIzLWE2NjUtMTIyMTE4ZWMzNzNlIiwiY3JlYXRlZCI6IjIwMjYtMTAtMTFUMTE6NDE6NTYuNzAyWiIsInVwZGF0ZWQiOiIyMDI2LTEwLTExVDExOjQxOjU2LjcwMloiLCJ2ZXJzaW9uIjpudWxsfQ==
+.yandex.ru	TRUE	/	TRUE	1826280593	pcuid_context	5122998331791720592
+.vk.com	TRUE	/	TRUE	1823596998	remixlang	0
+.youtube.com	TRUE	/	TRUE	1826280945	LOGIN_INFO	AFmmF2swRQIgfyhFid0qHqDavVC79EONMKk_S9u4eu2JEiu3S7nw7gsCIQD1qL6tcsgg7n_Br2A9aQRg3-jrYa5bwOEAtkKFf-2k3A:QUQ3MjNmeW9pYmFJZXFnUGlFUVpoNFN0cGRZcjF5cXBXVGdUZkpicklrU2NNNlBieXBSM01IQUdJT3NUMl81R1R3U0hUVU1ZanJ3OWRWNGNJY3VhenpndHFUT0xpYkEtcUJFTllIZVdjVFd5eHdoRk1nVXJSdzZEdlB2Qld2WWFYcmVDYkx2XzB0cUFqN1lNOFpGTGIwYzNYSGhTVzN2c3ZPWWlIVUs5NWZlMXNSR0VubjJfbTdXNjRwMXZKZWRSRzl3TS1LTlVwektLRl9lSWxIbHk5UU1kdGhYaEdpQlI0QQ==
+.googleadservices.com	TRUE	/	TRUE	1799497005	ar_debug	1
+.adobe.com	TRUE	/	FALSE	1823257009	s_nr	1791721009647-New
+.adobe.com	TRUE	/	TRUE	1825849010	kndctr_9E1005A551ED61CA0A490D45_AdobeOrg_identity	CiYwODM4ODc2MjQ5MDg2NTc3NjMyMTQwNTg2Mzg4Njg2NDY3MzMyMVITCL3hk9eSNBABGAEqBElSTDEwAPABveGT15I0
+.adobe.com	TRUE	/	TRUE	1826281010	mbox	session%2308388762490865776321405863886864673321%2DmISELM%231791722869
+.adobe.com	TRUE	/	TRUE	1825417010	AMCV_9E1005A551ED61CA0A490D45%40AdobeOrg	MCMID|08388762490865776321405863886864673321
+idg.adobe.com	FALSE	/	TRUE	1795609074	idg_token	HGOkf1OnioUGpUjzHeSVn61h1H7nUlO7S8zuq5MFlPSE/dSoNPn2IGB92A2unFRS
+.services.adobe.com	TRUE	/	TRUE	1794140220	gds	eyJhbGciOiJSUzI1NiIsImtpZCI6Imltc19uYTEta2V5LWdjLTEiLCJpdHQiOiJjayJ9.eyJ0dGwiOjI0MTkyMDAsIm1vaSI6IjI3MWViMjY2IiwiZG9tYWluTWFya2VyIjoiLnNlcnZpY2VzLmFkb2JlLmNvbSIsImdkaSI6IjE3OTE3MjEwMTkwODdfODEzM2Y5OTgtMmJlZi00YzliLWExNzEtNTY1NTRjMTRkOTAzIiwiY2xpZW50X2lkIjoiYWNyb2JhdG1pbG8iLCJjcmVhdGVkX2F0IjoxNzkxNzIxMDE5LCJleHBpcmVzX2F0IjoxNzk0MTQwMjE5LCJmaW5nZXJwcmludF9kZXZpY2VfaWQiOiJkMDkwM2E1Mi1lMDgyLTRhOWYtYjIwNS03ZGZjMjc1Njk3NGIifQ.bK-eyoQ191NB-KSS03VjP2b5_NChwsgl6JTU5SPZqRp2jLZWqpPdXJCS-3-ukhT1_RWUT4IUCtP-EuT2HPvh4U10oVap2Jae-i98bDT9uCmIqGQparEYTPOuivKa226i85MI8I4xluTPpiqxap_CoovcIU6Ngm-CKp_Zwz5-BJBmIKDXKEADFGb0h_6GxzLLbcUqo7lNmqOBqXb0fE7y3eLL8U7q1fViHMpQ1EISIq6NfD7a8hY9_sxZ5wfXBjfZebKsMtG3YioNpoBF_NSmxx9ZoGVjbhZvN_sXZpGEOizgLUje7tb6kASTJLO1y22aJkBxsBzyGJfRCwACPyCg7A
+.adobe.com	TRUE	/	FALSE	1826284499	forterToken	7d3f5d172e154dfaa9cd28dc8b162ba1_1791721022212__UDF43-m4_31ck_eAUs6+8ec1k%3D-8322-v2
+.www.adobe.com	TRUE	/	FALSE	1826284499	forterToken	7d3f5d172e154dfaa9cd28dc8b162ba1_1791721022212__UDF43-m4_31ck_eAUs6+8ec1k%3D-8322-v2
+.adobe.com	TRUE	/	TRUE	1823260669	OptanonConsent	isGpcEnabled=0&datestamp=Sun+Oct+11+2026+20%3A17%3A49+GMT%2B0700+(%D0%9A%D1%80%D0%B0%D1%81%D0%BD%D0%BE%D1%8F%D1%80%D1%81%D0%BA%2C+%D1%81%D1%82%D0%B0%D0%BD%D0%B4%D0%B0%D1%80%D1%82%D0%BD%D0%BE%D0%B5+%D0%B2%D1%80%D0%B5%D0%BC%D1%8F)&version=202501.1.0&browserGpcFlag=0&isIABGlobal=false&hosts=&consentId=efadaa0c-f96a-45a5-8d2b-0e5804d120ad&interactionCount=1&isAnonUser=1&landingPath=https%3A%2F%2Fwww.adobe.com%2Ffr%2Facrobat%2Froc%2Fcampaign%2Fpdf-ai-tool.html%3Fttid%3Design%26sdid%3DSTLMLQFM%26mv%3Dsocial%26mv2%3Dpaidsoc%26gad_source%3D2%26gad_campaignid%3D24169568049%26gclid%3DCjwKCAjw56zWBhB0EiwAdPOQOZcUc655987pzO3kR27m3ZZl1ajVjY757qeqRW8gs6PidcHpDDUg5xoC3oIQAvD_BwE&groups=C0001%3A1%2CC0002%3A0%2CC0003%3A0%2CC0004%3A0
+www.bing.com	FALSE	/	TRUE	1791839722	__Host-XY	CfDJ8Pj64jZaZ_RFrelrus2TRAB0Hs6kQoDngdnLHFIotr8ggkXURlSnsTDUBH4HvfGp055uICfNL5nPdykW3w9nCA3okw8-i2q19Pz5PltB5-f_69VRpTxdcuSiRFQ2_3WFIHCOlrVJki1prHiKJnYtLHf_SIxv2YKSVvgjTCgtY-9I9XNF9-LlQ7xbWMCtS778aEUmijspDH4iAS6a8yp52YSI35mhZDfit6W4FfUGkWtdBN2AoENODk6FCglHi-65xiIfxICrLcLVJ07pDuE1vG4
+.bing.com	TRUE	/	TRUE	1825498311	SRCHHPGUSR	SRCHLANG=ru&IG=8B982AA5891A413B9E131F1CE61A3D74&PV=10.0.0&PREFCOL=0&BRW=XW&BRH=M&CW=1592&CH=776&SCW=1577&SCH=4127&DPR=1.0&UTC=420&P=CfDJ8Pj64jZaZ_RFrelrus2TRABecAkASCjEmdmnqYl3RCXYT74cSAki0AvoySENdtIw-AtqEc7QvKE5XUL6ABKYeEBTeZMug_MCtDyx3_GDlkTTZSEruqmzSwRUn4Bh6p08-y-b42ZTYhlCEJwhftzpozLo-az-R6AWG0SapcqmVC5VZTcVrLRs6pkgvRj1uDmFUw1&EXLTT=3&HV=1791642647&HVE=CfDJ8Pj64jZaZ_RFrelrus2TRABVZcckGbpC0kPGiDra16Jd-6ooQk1OVr5KYk_kXKyolBK2jjBeUmKlIt8XgpwiZvRoT1QpdCdJ1jV5ZTs1dQZvPLlyluX_s3fETY8SZvLGvh8mX_n-HlGQXrmNkYRLO-vV9l2cNj4FhBShJ9xBE8WUbvaIw6i9mmkT0mRObOTsCg&PRVCW=1592&PRVCH=774
+.msn.com	TRUE	/	TRUE	1794394310	lt	eyJhbGciOiJkaXIiLCJlbmMiOiJBMjU2Q0JDLUhTNTEyIiwia2lkIjoiLU9iNWZiZGE4aFduTmJpX2hjaWpWZzE4cFBCRGRFWXZWT3FCNjNYdjJBUSIsInppcCI6IkRFRiJ9..tDNmlpzZepBoB9psAB98IQ.d3PhErXKdtgFdyXjAdQ_XOBJcGqnR2t9NdaohxkG540wE4Pu3TFCpeHJ-h0eoUftGlWNQTKKRqXaQx9m55rxbuST5XL3GD31CXZVno4eJ4RXDVq2cNr8R-s6VWxjqEIdZQaan2n6O70M7hnj1_-vMboAAztKoG2smiRBtRDwjGyBKJ_LVaqLhWJ1Bod-zb5JPDMt5Namw5Vu-E2k4Z56nuk6P3hTl4dvE1L7GU_VPkSUBGBfnAnaw_GEzy3dak4-2Pfe9vMJknBbx0BTnt48rwsYezXLhDI8oBpBw5b0zw0vHBw1d6bTPj3p4iQDsJl3jFeZxGCnc6P_Ck-MiOfaK0vNz7QSH0ZjDyMVVV4B3IKR7N5C_aAyoJC2JR3F46rNKxxaAyoX8YYgFnLCO2xvopn1E6NIcE9AXdvz4RYSo8QzGKOCJALbanof2VSeZNL7EV1SneO8aQodbqW4TtQQjeRTRSW8Ja35hm576igDx4hzTmQh4m5PwEp6gvDbf8oUSgSqWys3WgTxP8UYinuZPC501vQAvoC0tP6AM1yUQh-QMllg6t85MQ8WW7j4c0QmFxKb5iWJ1jwiMIJcMiBnkbhgYFwD2GaMrLXMLtozwhJ_fIVYH543S4VXnvdS1lRYZULxxMojk6tkbsyDMqUTICHHR1aWq_72i7IGpGwhu7vafSOpnRSMBHN58LrXh_AXTt5E0LaNgVCI-60m2xVeLuX0-6K_SSVd6cMUIa7-A9iTnX4FXwkTzIZm4YfKyjSREEQ7QLm_4oqO7a7_f9Xcxo4clN1bMpJlk-hHyt4qT7GtJY2taEYksRLUG6zVIlOpgyNDCPmBTP29-cjm2hIZKNXPRFyfxfpMP7pxJ9sEv4per0Wg_P9-nFL7k-BeVpvg9nFkIYKATI6gT5rBlomyq8rX1eQZ9BrubNMTueoRlNMs83e1GbSzTw8WMoHZtnyBV0KpfJH_57eLfJ-UgSA404x8k8uBIGTUl4IYWjmmmZzSyVuNlbuLo5UKgutR1dnEvsBG6ngH5udRSo7hJPuMVXwi5o2yOb0GpkXv1uziCu2YGNMfVUNw9Nbi3rxnDQP2Aelw7WzIDefGJTbKdPSNve6ot4peaPB4LY0_xTgAFdyP21YomS43u32uPNCDvMY5gMoHvosQSe2IcEtKvS-frgW8FHyIvWPI8NfFQ5-XIg3f5kbI108HgHCfokEV8nTgTD3pS8mX9s7dz5CNDBQvUNrO-_VShsaHFfYNfXVoYHh2fmOWopQtqVILS4K-oT1TlLb5eZEZWFyvKV8-Gm1LuvOhyC3VxPl1M6gqOdh94_fgI-Ej4PkUeXf8Rg5lTsh6iAopSN27bV3cF4Wz1sUahf2YpRJsjdYO6U8stVQUm2Dcy4eNxkKyfqiP0m1K_RE_NIzAQNtsoVp6T9ADaGxx_MRTQbHL5_1gny_RzO9ccahr4N0luX6uQsZrZ2Mzx-az.1-4KGc26cldqKkPSV0LtqoMAkjHpPnTFsPZggsserq8
+.msn.com	TRUE	/	TRUE	1792378168	App-User	%7B%22userId%22%3A%22a-5158A609841166B2981CC7BDFFFFFFFF%22%2C%22cohorts%22%3A%5B%7B%22name%22%3A%22SuperCold%22%2C%22everSelected%22%3Afalse%2C%22reason%22%3A%22MatchedBySignal%22%7D%5D%2C%22accountType%22%3A%22MSA%22%2C%22identityType%22%3A%22App%22%2C%22settings%22%3A%7B%22userSettings%22%3A%7B%22rubyRefreshDaily%22%3A%220%22%7D%7D%2C%22responseCreationDateTime%22%3A%222026-10-12T02%3A49%3A25.5777746Z%22%2C%22debugId%22%3A%2285b5f7b1-2910-4d5e-a07c-618604c482a9%7C2026-10-12T02%3A49%3A25.5777781Z%7CAuth%7CNEU-CF%7Caksgen02000003%22%7D
+.dzen.ru	TRUE	/	FALSE	1791859768	front_fpid	cyQPFKm1_LB7taBlhyP9S
+.yandex.com	TRUE	/	TRUE	1826333373	yp	1791859771.yu.1201934391791292755
+.yandex.com	TRUE	/	TRUE	1823309371	ymex	1794365371.oyu.1201934391791292755#1823176100.yrts.1791640100#1823176100.yrtsi.1791640100
+.mc.yandex.com	TRUE	/	TRUE	1791859771	sync_cookie_ok	synced
+verify.yandex.ru	FALSE	/	TRUE	1791859780	adsrv_s_	33fc1f72db3cf487bc0
+.yandex.ru	TRUE	/	TRUE	1823309380	amcuid	6466418331791773378
+ntp.msn.com	FALSE	/	FALSE	1791859827	msaoptout	0
+.youtube.com	TRUE	/	TRUE	1825768109	__Secure-YENID	18.YTE=SzCdsNnd494IGIHJoq8fCi8tsyY_1fCFNzI-mmTuap5n_tyfWRXNNNfniHQt_7Jcbml2zgZAvMdaGPsKeCCSIAvKef8-0so5wz0t_gi8JcMBWvYb24MPJcZOAN3of7oX0cm81AlVZoPKzCyPT0O53um_J1WMlT3RsGh78HHJIYI28ENb5BvcbUxkSVPyV-uM9p5g0zJn66dEMRq8yhpOiqfRjfiMde6yODZ2MeVu1M_mo1xDtOKKOBMgbiwz8C6WIz5AURqdruAalLFTsZUgeTlgjMiFOz-PCHKyp-m75Yt1TshpQ_3_wMrNh0LGI152MO8xQxz2dbAdPO5baa4NPA
+.facebook.com	TRUE	/	TRUE	1826333519	oo	v1
+.facebook.com	TRUE	/	TRUE	1792379423	locale	ru_RU
+accounts.google.com	FALSE	/	TRUE	1826334650	__Host-GAPS	1:ID04hxF-JQc0UmVkopB0iQYOzvRV8dAQh-9VFOt_gh2yT60QRvDY-D1HLDCPW-Rt_0R78b880wAhB5_USgMl-sVVk62YhA:SKTUai2xK3Q3XH2f
+.google.com	TRUE	/	TRUE	1807585851	NID	Cv8CCAESsQIBOxGDSJGStYdPcddSiasChJepk47kO5hMmtEULyrOJMjnTplxbETFhcp2MkRDMeX9FzIWktIFAxk9OO6JGF_U52CsccAFDcacA96vCfiSNkWnyzgDvHfLDCXJD-jTW-itG8cVSBXq8z8jKc6US5yGq3pWOPa7LHl-MNyzSABVxpP_RPzrdFOFqU2NIVKPIpi0Zg0Vx1OS37-wEUSk6HdH5gnDtvGmDlAVgHohdAFr5qyzklKmrAIkaAs1QvwPnI9jig4z9Oq_8pprr7UyZ2VSdyBXOL7Ex8YZ5RFVy1o3P923iDuPAn3kMO5_fUoF70vVMTdPaTjWIMY1Ikq5ZGrKDH0wJo_K5o2nIpgHCiX99v3rEPQig6vZ8h_ZYvwbJXIqjLVly3u_o8mRoKTMrm8oJigBMkUB0qwHz9r32xOV3j5xUE4O99W1UC7SrauuUUPAj8daphN6V41BqBdBMu6_JOyg_Iqa9Zaffhjl1uFti65a2KPUleZVVw4
+.facebook.com	TRUE	/	TRUE	1823314606	c_user	100010271560418
+.google.com	TRUE	/	TRUE	1825479692	__Secure-ENID	Cp8CCAIS0QEBAQxeRco4FmwxAD9aoUaWvUuzB2qkoDpKDg_outsLSSThxXhWbvNfepZMAHzpBtcwZb0WhUr_lYWTfQmmj-g9kxG1Rvppwli_3xiaTSKASyx9f4s0LIRMCnJYdxpeWUMQUL7xLpiepu-rUeUBwL3WmJJfzCM4nBmsouhUoTsanqzUOfhIGt9G5-WTHKsiOfSQlLQ2uxMquHKnDqKRxbI-iCUlgtJfTU3JkrbJ8oY2LIoIonYfSXxm2iM2OkY2r50DBsvzLntyf2Q-0qyvyLo1AigCMkUBfWzEqkeS_78NZ7E0MFuvu_-Gfq7_KGrtmTyyECPuuL6TUI2NijfqW9lhNShvHSq2Yjuwi0qvjsshfuNvSNfBgDYKpQ4
+.google.com	TRUE	/	FALSE	1823310660	SIDCC	AKEyXzUcJqEE9z1V57xg4w8cq78hppMO7Q98ZWp9HdIaeWhiQBPAjwxuxSbj7fS8Mxecf1iJlg
+.google.com	TRUE	/	TRUE	1823310660	__Secure-1PSIDCC	AKEyXzV_Pe0ZKcRVGdkRJXTqS_ScVgKYKHd1YFMKeAHRbBF5-kkSMgc-AfYQXj3pvqlY2_8N
+.google.com	TRUE	/	TRUE	1823310660	__Secure-3PSIDCC	AKEyXzUtBAQEs8jhe_pi3Vq1Jj0IFmolDMnfbruNdwWXjtDZiry6p49YwwDMo2ei-tTe-fR38A
+.yandex.ru	TRUE	/	TRUE	1792984314	cycada	kNGQO6px33dYNBnWikVpqO1le2zmcBx7IQBDZ8y4DZA=
+dzen.ru	FALSE	/	FALSE	1791861543	tmr_detect	0%7C1791775143446
+.doubleclick.net	TRUE	/	TRUE	1825416952	IDE	AHWqTUk82mn3NmSiKkvAGFb9jhjn5opC9wjwd-KN2PsTqk4ZoRGe5_Vg7ji8CIFcT8Y
+.archive.org	TRUE	/	FALSE	1823311201	donation-identifier	c1f46bb7d73fdb06739ad1827699eb36
+.facebook.com	TRUE	/	TRUE	1799554603	fr	0wXQ4bVa6sTIolVlY.AWfx0fytrBJ-M_-iz6jdYW9aOjagSHD_FLyy4aCUltQD3Fo10YI.BqzE_B..AAA.0.0.BqzF8o.AWckcxq3lLcDlbkRgZgc4wYd__s
+.facebook.com	TRUE	/	TRUE	1823314606	xs	39%3AN0Ld0BSJAQmHFQ%3A2%3A1791774652%3A-1%3A-1%3A%3AAcwxHKDKQc_2NYAAqj_qmjblEkguZMdrjZDWxw7G4Q
+.facebook.com	TRUE	/	TRUE	1792383407	wd	1600x828
+.instagram.com	TRUE	/	TRUE	1792407113	wd	1600x828
+.instagram.com	TRUE	/	TRUE	1826338693	oo	v1
+.sso.dzen.ru	TRUE	/	TRUE	1826339253	i	abCNIcXkc0KXxcHb+FTJ/Vvx3fYLyTcEXR9oB8ZC+NE5V3vxc8Ao2pyRF/zjwqpW4JHcZPFK/M0gkbvIKtD8RAJgKxQ=
+.yandex.ru	TRUE	/	TRUE	1826339253	bh	EkIiTWljcm9zb2Z0IEVkZ2UiO3Y9IjE1NSIsICJDaHJvbWl1bSI7dj0iMTU1IiwgIk5vdChBOkJyYW5kIjt2PSIyNCIaBSJ4ODYiIg8iMTU1LjAuNDI4My40NSIqAj8wMgIiIjoJIldpbmRvd3MiQggiMTAuMC4wIkoEIjY0IlJcIk1pY3Jvc29mdCBFZGdlIjt2PSIxNTUuMC40MjgzLjQ1IiwgIkNocm9taXVtIjt2PSIxNTUuMC44MDU5LjQwIiwgIk5vdChBOkJyYW5kIjt2PSIyNC4wLjAuMCJaAj8wYLPDsdYGaiHcyuH/CJLYobEDn8/h6gP7+vDnDev//fYPobXNhwiAwQM=
+.dzen.ru	TRUE	/	TRUE	1826339254	_yasc	+UaS525+Lxd5ww0oiGHlhbIqmuL5fbOlfVTH/FDX8HcIXdCd0RJxXhGrTkZVaC5nTnE/qn0=
+dzen.ru	FALSE	/	FALSE	1792384059	domain_sid	cyQPFKm1_LB7taBlhyP9S%3A1791779258596
+.yandex.com	TRUE	/	TRUE	1826339264	_yasc	iyhaT2By9FvctRqt4GL27ty1HSG8kqNJaNnRh4kO8Syc5v+wXbfYPiwRB2SixT9Aq8iiXfQ=
+.yandex.ru	TRUE	/	TRUE	1826339264	yp	2107002446.udn.cDpwaXJuZXI0NDQ0#2107139264.pcs.0#1792506456.dlp.3#1794234456.gph.225_124#1792247257.szm.1%3A1600x900%3A1576x776%3A15#1794320857.hdrc.0#1791794974.iapfr.1
+.yandex.ru	TRUE	/	TRUE	1826339264	_yasc	/0kYOWpfgH1eiBi3tK57Swy7LUUeNb6Q/4okUeIapDC2FHfiDEsHrQCOfSZMQKxIcSn2udwf0SR/TPghjjDItf6b5mjD6sxvb/exEwWXoEbC26xiOfXI
+.yandex.com	TRUE	/	TRUE	1826339263	bh	EkIiTWljcm9zb2Z0IEVkZ2UiO3Y9IjE1NSIsICJDaHJvbWl1bSI7dj0iMTU1IiwgIk5vdChBOkJyYW5kIjt2PSIyNCIaA3g4NiINMTU1LjAuNDI4My40NSoCPzA6CSJXaW5kb3dzIkIGMTAuMC4wSgI2NFJaIk1pY3Jvc29mdCBFZGdlIjt2PSIxNTUuMC40MjgzLjQ1IiwiQ2hyb21pdW0iO3Y9IjE1NS4wLjgwNTkuNDAiLCJOb3QoQTpCcmFuZCI7dj0iMjQuMC4wLjAiYL/DsdYGaiHcyuH/CJLYobEDn8/h6gP7+vDnDev//fYPobXNhwiAwQM=
+.youtube.com	TRUE	/	TRUE	1825768108	__Secure-YEC	CgtRaDZmVld1UTF5TSi_w7HWBjIoCgJGUhIiEh4SHAsMDg8QERITFBUWFxgZGhscHR4fICEiIyQlJicgbWLgAgrdAjE4LllURT1TekNkc05uZDQ5NElHSUhKb3E4ZkNpOHRzeVlfMWZDRk56SS1tbVR1YXA1bl90eWZXUlhOTk5mbmlIUXRfN0pjYm1sMnpnWkF2TWRhR1BzS2VDQ1NJQXZLZWY4LTBzbzV3ejB0X2dpOEpjTUJXdlliMjRNUEpjWk9BTjNvZjdvWDBjbTgxQWxWWm9QS3pDeVBUME81M3VtX0oxV01sVDNSc0doNzhISEpJWUkyOEVOYjVCdmNiVXhrU1ZQeVYtdU05cDVnMHpKbjY2ZEVNUnE4eWhwT2lxZlJqZmlNZGU2eU9EWjJNZVZ1MU1fbW8xeER0T0tLT0JNZ2Jpd3o4QzZXSXo1QVVScWRydUFhbExGVHNaVWdlVGxnak1pRk96LVBDSEt5cC1tNzVZdDFUc2hwUV8zX3dNck5oMExHSTE1Mk1POHhReHoyZGJBZFBPNWJhYTROUEE%3D
+.youtube.com	TRUE	/	TRUE	1823317348	__Secure-1PSIDTS	sidts-CjUBkldj_9P1tPUIzI0_Y0bWWibMC3P0xwlCbkoOGYHnkiagACophYOa1m-Zg9ZlET3B8GQuhBAA
+.youtube.com	TRUE	/	TRUE	1823317348	__Secure-3PSIDTS	sidts-CjUBkldj_9P1tPUIzI0_Y0bWWibMC3P0xwlCbkoOGYHnkiagACophYOa1m-Zg9ZlET3B8GQuhBAA
+.youtube.com	TRUE	/	FALSE	1823317548	SIDCC	AKEyXzWzVDhkLK6PP6hMesHVKAF95B-NH4Rk0UF6Jt1Ri8qw4F5NOlsa1RHu33UxO0AW1V1FNQ
+.youtube.com	TRUE	/	TRUE	1823317548	__Secure-1PSIDCC	AKEyXzX9gBHGvizfl9uqf57xiNaNZizcgjyHGONh7QKMAfQmMZyhoTe9ALqORPaYCmUuxPbA
+.youtube.com	TRUE	/	TRUE	1823317548	__Secure-3PSIDCC	AKEyXzWZbnPzLv6I8YzpAZfeU83EMWIjPeL-JnPNiBE6zIsx7GBGSEmrKVT6exUrxZIUISgJJw
+.bing.com	TRUE	/	TRUE	1791888711	.MSA.Auth	CfDJ8Pj64jZaZ_RFrelrus2TRAAB_6gBEf35aIvK1jBK3qLGb_81bvLmLfpC8nCtjlA7uThLWGGMs-9WIDiB2zGgEgReyJSFrSB_F63dw4J3Ho7osy8_rlyUB5XE0Ue_fsXfcSOluAgulmRS5Tsj3Z18AM--HID1iAtqoRg59qQUUwg-Te9yYh9eYJM6kmBIFKJ4HgU0-jPeliw_WTByYJO0ppibsqnYrovb_byzhRAqTavzOoXHkLeUzWvvjuwEyjkCVZGLpfOkGZT-GkvP6wZSv-6TlUIr0yIlnDJIeVGvMsb5ag_6mPFKnT92lWKn8_dW-L2VAu1mF3g33tfnMF80Tlvs5U6bL2YoyB1kntjLlJFAUh771Of9XexsZz0D5m562g
+.bing.com	TRUE	/	FALSE	0	_EDGE_S	SID=0C5FD796C68169331108C066C7ED6897
+.bing.com	TRUE	/	TRUE	0	WLS	C=00000000-0000-0000-53d3-fbf76c53317c&N=
+.bing.com	TRUE	/	TRUE	0	_SS	SID=0C5FD796C68169331108C066C7ED6897
+.bing.com	TRUE	/	TRUE	1793011911	_U	1dh3TH8GkjdPa6rBX95jT2yymvGqY86LfHiiRYkrae0wXRAWFCYR1fDoECoYVdnUadQTSMhIsf-qFRmD3tyd05jVrsFmYYmkMNjU3YCG3iZiNzG2y9TmUraU2hcWtNI832L6SipfDQ04bpddJ3620ys943vbjE1eXDMzgBesLYL3UN4ACvRswpdApb3GcThEvVIooECMQPEulsklPjS1RtrnoK3wzNhmPcHIiJceSAJI
+.instagram.com	TRUE	/	TRUE	1823338312	sessionid	64880769641%3AKEoz2dJQTGVR5g%3A23%3AAYkUB3cbIkMZAFHsDXtDJG6YAqRZ7YWpaFeLph2NGw
+.instagram.com	TRUE	/	TRUE	0	rur	RVA%2C17841464849240096%2C1793012466%3A01ff3d9e7923b6375d2320a921d3bd6997b38571df1f488dc2b924f23264ef1a3bfe454d
+www.googleadservices.com	FALSE	/pagead/conversion/335796524/	TRUE	1799496975	Conversion	EgwIABUAAAAAHQAAAAAYASCi4uPlr7aO1z1IAWpbQ2p3S0NBanc1NnpXQmhCMEVpd0FkUE9RT1pjVWM2NTU5ODdwek8za1IyN20zWlpsMWFqVmpZNzU3cWVxUlc4Z3M2UGlkY0hwRERVZzV4b0Mzb0lRQXZEX0J3RXCCtfbh-LGXA5AB9vjF3bkWmAEE
+www.google.com	FALSE	/recaptcha	TRUE	1807193661	_GRECAPTCHA	09AKhCRwgU0Tc7Y1jQgIUTLYub_W9QtrzssNQZZKN7T3R_uSFAcD1iu1TM7EEAqt1f_-JooqRHDgMp_FII77ub3X4
+ntp.msn.com	FALSE	/edge	FALSE	1796823397	__rubyUX	false
+.msn.com	TRUE	/edge	FALSE	1807504086	pglt-edgeChromium-ntp	2339
+.yandex.ru	TRUE	/	TRUE	1825852756	is_gdpr	1
+.yandex.ru	TRUE	/	TRUE	1825852756	is_gdpr_b	CL7bERCAoAMYAQ==
+.yandex.ru	TRUE	/	TRUE	1825852756	pi	zRyXXDDNeuFxHPBXk7ohVHxx91spXZlbvA7czJNSosFVdTPcg24AjsW5smiWf3ZnCIgvW8Un1DglVVKEWGp2qATulyc=
+.yandex.ru	TRUE	/	TRUE	1825852756	i	HyjBuQL9O5ZFm5vmoPj1Rqo9/y16n/6cXMUn+jjMXCH6aHXi88HwQYMeAwww0GPgmahOfdkdlAVpQztMnJMTktTf47A=
+.yandex.ru	TRUE	/	TRUE	1823178394	yandexuid	1201934391791292755
+.yandex.ru	TRUE	/	TRUE	1822828756	yashr	6848806221791292755
+.dzen.ru	TRUE	/	TRUE	1825852756	zencookie	4465667271791292755
+.dzen.ru	TRUE	/	TRUE	1792502358	zen_sso_checked	1
+.dzen.ru	TRUE	/	TRUE	1822828758	yandex_login	
+.dzen.ru	TRUE	/	TRUE	1825852758	yandexuid	1201934391791292755
+.dzen.ru	TRUE	/	TRUE	1825852758	mda2_beacon	1791292756418
+.dzen.ru	TRUE	/	TRUE	1792502358	zen_vk_sso_checked	1
+.vk.com	TRUE	/	TRUE	1822828759	remixstid	1354209989_7oLa4dQWGoxPTkButM91Dw2IzFdSyKIzbMCUiOtzwR0
+.vk.com	TRUE	/	TRUE	1822828759	remixstlid	9072187078429869927_bPkPSuuEfgupc4tuZwviO2T7vBErWRFndVHroWMfhG4
+.sso.dzen.ru	TRUE	/	TRUE	1822828760	yashr	5439208361791292759
+.dzen.ru	TRUE	/	FALSE	1823315259	Zen-User-Data	{%22zen-theme%22:%22light%22%2C%22zen-theme-setting%22:%22light%22}
+.dzen.ru	TRUE	/	TRUE	1822828761	_ym_uid	1791292762724969328
+.dzen.ru	TRUE	/	TRUE	1822828761	_ym_d	1791292762
+.dzen.ru	TRUE	/	FALSE	1806844762	compliance-alert	true
+.dzen.ru	TRUE	/	FALSE	1825852762	zen_gid	10502
+.dzen.ru	TRUE	/	FALSE	1825852762	zen_vk_gid	2249
+.dzen.ru	TRUE	/	FALSE	1825852762	zen_extra_gid	
+.dzen.ru	TRUE	/	FALSE	1825852762	zen_extra_vk_gid	
+.yandex.ru	TRUE	/	TRUE	1825852762	pi	TH43B8kpDIaiko3xhfirgHVpS+WXVuiz/Q5Ovx2e+zIXrcbtxigw8X38FA2Vic26RyE8xDOqnX+6/bUNe76dLGcoaZ0=
+.yandex.ru	TRUE	/	TRUE	1822828762	yashr	4460714511791292761
+.vk.ru	TRUE	/	TRUE	1822880725	remixlang	0
+.vk.ru	TRUE	/	TRUE	1822828763	remixstlid	9072046340945964607_rozcnfy8p984zfzziGjsZFWzKPPdpTK1zIDMhvu5KSg
+.vk.ru	TRUE	/	TRUE	1823408080	remixuas	YzJkNTI0NGE5MjU2YTQ2YjVlOTAzMzIw
+.dzen.ru	TRUE	/	FALSE	1820550458	tmr_lvid	75f07f27b11f79e7a01e669d09af4592
+.dzen.ru	TRUE	/	FALSE	1820550458	tmr_lvidTS	1791292764476
+.bing.com	TRUE	/	TRUE	1825336094	MUID	123C1E9391A065CB3E1B097990756440
+www.bing.com	FALSE	/	FALSE	1825498311	MUIDB	123C1E9391A065CB3E1B097990756440
+.bing.com	TRUE	/	FALSE	1824988774	_EDGE_V	1
+.bing.com	TRUE	/	TRUE	1824988774	SRCHD	AF=NOFORM
+.bing.com	TRUE	/	TRUE	1824988774	SRCHUID	V=2&GUID=7B921DAC630C42D48A52EEC9BD0FD2BC&dmnchg=1
+.bing.com	TRUE	/	TRUE	1807527111	ANON	A=5158A609841166B2981CC7BDFFFFFFFF
+.msn.com	TRUE	/	TRUE	1792407110	elt	%7B%22access_token%22%3A%22eyJhbGciOiJkaXIiLCJlbmMiOiJBMjU2Q0JDLUhTNTEyIiwia2lkIjoiLU9iNWZiZGE4aFduTmJpX2hjaWpWZzE4cFBCRGRFWXZWT3FCNjNYdjJBUSIsInppcCI6IkRFRiJ9..X-s-Cdm4z4dT09r3O_194g.Dma2GaYVaQpGLehZqcs_ZZBMWpuho7NKb_JtU9U1nKZWdaV47TfQy9o1E-KGQlaz5tZ1sWmL3hUFstIKK5goiHeQcbVVHS42XPZhq5BIuds244emolMwYmxCke5GK5yq4gIPMCmirob0hSfu4cVbre8FOmOYTcc0rm7275Dk4TJ6mPCWeQkYx5MG-UprfHLVeS9emgn_rKOydb0DlO1zuFUB4IEQTeGX38jLJBF5U_tUPipxDKc2lOf3bUJQbWzvD0_ewS9IDKZ7Ibx5traSzKzGruudda5qbf4DhjZ43geEtjtp8Weo4a8F3KLDRs0zHOmlbHAIJq6Q5IHS7VCvIwKylOYsmTgsUhGL0FGVKvpsjZSJ6tDFay7zlJ1assgEF8GjNSOUbWKK05Mp5wHyCniNZzIgwGYFHFucj6gG5PCsQgZznIirhNfarp9hCkAO3GPwjHmEonyTbDuJuzfd-6rz6sQPyRSdHpJmtOKyUBxZPcEhkTTOc6juZL4nBPUfJ4Apm1y87RZnCN1Yuk1MnpapfeI02M-y7Ef6_-9APB4LfyCika0oa0EyIUX784PmPcacaRuucFuDjU7mXqcgF4KbWSxiVNYhLHyRWka9aAamCGMFha_NU3CoT--CSYRxSOMFyIpAFB_GhAzt2sk8ev-TYj-dDZvO-BHtPWUscX2MF5krPCh56jtqIVM3Zd_WA4sg-v5cpbgLC9bo_5s2yG8rE4Qk5MiEDo6PspTqm9dSQi2hpcJlUfX91CjoCeIHnjs8YyrajXNPbEjanb0RD979vmnbzbBoULEQI1N_yDMJ0f8iFMQHWx0RH2yWH0Vxf0OQIPp3dSmB6m8mT73enEXBlmLw-srIz5je4NoUokhsfcXXeF2C7GrTTRRtfU0rxqGVS6-v62Je7gMepdV0cP8IldNl0hglUYsNNn77BMJCeKfPvKubCPaQ9u35Ia6oB_olDdTQe2rinOvtBcZL2oWXL_xHf3Q8QjSPWX4Y91VzwN2qicogZt8HMfJaJEBhcJ4-EILwjjinEE9DFEsDJQNpzhUyI706ncu9zLJkurTv3TTAZ2tj3q3IM8iEWaWnXyPU64AIoY7sL1fCh99VAQfipoDWkxPcljE8jtQ89yeTU8SryvJeczjqZv1O4fHl85L1zY4Rzkf6hF74VKiWuQmF8_slyda6VB-6o7sXhnCpMYVRkw0pLH-bgaMiiwQwVwZUJs6enrSuUsQ_hCLe9QqcdZgyVQFsalayilepNZ2D8PmlNgJjqg9yHwE0gXT4xkIEc0FczShdCthpnaFM_tpHAo8BeSLs2Y0GMmK9VaBvv2OD4PE-gKe9khwhZXMuR9mmivXhlXHxzFiSEJNlCCNvRaTBI5tiMibY8sNGy1MOIV89u3ZfD-iiw1g_1Z89IJGNZcjLPn_uRABBcz15txTofj-GwUOlsJCY3RU_nic.ENEWbmSXSWRQfMuwZQeuhV3wJNVxLnefCmpugt56n_g%22%2C%22account_type%22%3A%22MSA%22%2C%22login_hint%22%3A%22M$Ejx4nOO4vOz9_vNvr8yoEZItyCwqrUrMSy0qziyuTMwztLQwcEjPTczM0UvOz5W4dPfKkl__gYARAJ_hGjk%22%2C%22e%22%3A%2250e5ecb9%22%7D
+.msn.com	TRUE	/	TRUE	1792407110	eltc	%7B%22account_type%22%3A%22MSA%22%2C%22e%22%3A%2250e5ecb9%22%7D
+.google.com	TRUE	/	TRUE	1825420993	SOCS	CAAaBgiA9JDWBg
+consent.google.com	FALSE	/	TRUE	1793884994	OTZ	8816483_28_32_123600_28_436080
+accounts.google.com	FALSE	/	TRUE	1793884998	OTZ	8816483_28_32_123600_28_436080
+myaccount.google.com	FALSE	/	TRUE	1825853323	OSID	g.a000DQl_0g_6EfvX0008rZFWQhpmJlWt1MHJYT7TLlylKEUNaagZW0wJkGkkhf_qsEIQ7NLA2wACgYKAeMSARQSFQHGX2MijS30wH-vdXiXZ1llEIGTkRoVAUF8yKpjAXQ4aKDtDHPMKfRXZcfE0076
+myaccount.google.com	FALSE	/	TRUE	1825853323	__Secure-OSID	g.a000DQl_0g_6EfvX0008rZFWQhpmJlWt1MHJYT7TLlylKEUNaagZ8g7hNdnW4jV7iN9qCqVPzQACgYKAS0SARQSFQHGX2MiW4xqwSwCfLx19aX2JzbRiBoVAUF8yKqCtqcBN7V0klLEzJFBcn0z0076
+myaccount.google.com	FALSE	/	TRUE	1793885327	OTZ	8816489_28_32_123600_28_436080
+ogs.google.com	FALSE	/	TRUE	1793885343	OTZ	8816489_28_32_123600_28_436080
+.bing.com	TRUE	/	TRUE	1825923833	SRCHUSR	DOB=20261006&DS=1
+.instagram.com	TRUE	/	TRUE	1826198304	datr	HzvKajbPEEMVUz4S-o-14nnc
+.instagram.com	TRUE	/	TRUE	1823174304	ig_did	A6B07524-7701-4AEE-9048-23E5DB106995
+.instagram.com	TRUE	/	TRUE	1826198304	mid	aso7HwALAAGK2ynaFhcMQg8v7UpC
+.facebook.com	TRUE	/	TRUE	1826198317	datr	LDvKasJWa-zv9mIvv0KUT3UP
+.facebook.com	TRUE	/	TRUE	1826334659	sb	LDvKasB8QQOk8gmuyxAVj5Np
+.instagram.com	TRUE	/	TRUE	1826362407	csrftoken	SQVfYYGN4lVhG5JvTX2dcZ9pUC49DRlW
+.instagram.com	TRUE	/	TRUE	1799578407	ds_user_id	64880769641
+.dzen.ru	TRUE	/	FALSE	1791865659	is_auth_through_phone	true
+.dzen.ru	TRUE	/	FALSE	1791865659	is_online_stat	false
+.dzen.ru	TRUE	/	FALSE	1822743276	stable_city	1
+.dzen.ru	TRUE	/	FALSE	1791898476	has_stable_city	true
+.vk.ru	TRUE	/	TRUE	1822573512	remixstid	609376490_S4yDwzACTbyDdMbDxqAjaKUMdldVxrP7EawPOoqcbVX
+ntp.msn.com	FALSE	/	FALSE	1826199397	sptmarket	ru%7C%7Cfr%7Cfr-fr%7Cfr-fr%7Cfr%7C%7Creason%3DRevIP%3Afr%7Ccf%3D5%7CRefA%3D6aca3f64f33c41f0afd494aacd43102d.RefC%3D2026-10-10T13%3A36%3A36Z
+.msn.com	TRUE	/	TRUE	1826199397	USRLOC	CLOC=LAT=48.5829|LON=7.7437|A=50000|TS=261012042741|SRC=I&BID=MjYxMDEyMTEyNzQxX2RjMGYyNTFkOWY0YjMwNGM3ODNiM2MzNjlkM2MxOGE0YTNhYWZhMDhiYTM3MWVkNmU0ZGIzZGE3M2U4N2M2MzM=
+ntp.msn.com	FALSE	/	FALSE	1825335397	MUIDB	030A579B41406FAD089D407540066E26
+.msn.com	TRUE	/	FALSE	1825335397	_EDGE_V	1
+api.msn.com	FALSE	/	FALSE	1826199397	sptmarket	ru-ru%7C%7Cfr%7Cfr-fr%7Cfr-fr%7Cfr%7C%7Creason%3DRevIP%3Afr%7Ccf%3D5%7CRefA%3D6aca3f654fce4fdbbec262e82e0d102b.RefC%3D2026-10-10T13%3A36%3A37Z
+.msn.com	TRUE	/	TRUE	1807191398	APP_ANON	A=5158A609841166B2981CC7BDFFFFFFFF
+.msn.com	TRUE	/	TRUE	1807191398	aace	%7b%22child%22%3a0%2c%22expiredOn%22%3a%222027-04-08T13%3a36%3a37%22%7d
+.msn.com	TRUE	/	TRUE	1807191398	els	%7b%22account_type%22%3a%22MSA%22%7d
+api.msn.com	FALSE	/	FALSE	1825335398	MUIDB	030A579B41406FAD089D407540066E26
+.msn.com	TRUE	/	TRUE	1799555287	msnup	%7B%22cnex%22%3A%22no%22%7D
+.msn.com	TRUE	/	TRUE	1825335404	MUIDB	030A579B41406FAD089D407540066E26
+.ntp.msn.com	TRUE	/	FALSE	1823176093	sptmarket_restored	ru%7C%7Cfr%7Cfr-fr%7Cfr-fr%7Cfr%7C%7Creason%3DRevIP%3Afr%7Ccf%3D5%7CRefA%3D6aca3f64f33c41f0afd494aacd43102d.RefC%3D2026-10-10T13%3A36%3A36Z
+.c.bing.com	TRUE	/	TRUE	1792244894	MR	0
+.c.bing.com	TRUE	/	TRUE	1825336094	SRM_B	123C1E9391A065CB3E1B097990756440
+.c.bing.com	TRUE	/	TRUE	1825336094	SRM_M	123C1E9391A065CB3E1B097990756440
+.msn.com	TRUE	/	TRUE	1825336094	MUID	123C1E9391A065CB3E1B097990756440
+.c.msn.com	TRUE	/	TRUE	1825336094	SRM_M	123C1E9391A065CB3E1B097990756440
+.c.msn.com	TRUE	/	TRUE	1792244894	MR	0
+.yandex.ru	TRUE	/	TRUE	1823178394	yuidss	1201934391791292755
+.youtube.com	TRUE	/	TRUE	1807192100	__Secure-BUCKET	CM8G
+.youtube.com	TRUE	/	TRUE	1825907266	VISITOR_PRIVACY_METADATA	CgJGUhIiEh4SHAsMDg8QERITFBUWFxgZGhscHR4fICEiIyQlJicgbQ%3D%3D
+.youtube.com	TRUE	/	TRUE	1826339269	PREF	tz=Asia.Novosibirsk&f4=10000
+passport.yandex.ru	FALSE	/	TRUE	1826202324	uniqueuid	0df3eccdb3fa4378932ce21d8c4b93541791642323
+.yandex.ru	TRUE	/	TRUE	1823315264	gdpr	0
+.yandex.ru	TRUE	/	TRUE	1823254908	_ym_uid	1791642325131526318
+.yandex.com	TRUE	/	TRUE	1826333373	yandexuid	1201934391791292755
+.yandex.com	TRUE	/	TRUE	1826333373	yuidss	1201934391791292755
+.yandex.com	TRUE	/	TRUE	1826333373	i	HyjBuQL9O5ZFm5vmoPj1Rqo9/y16n/6cXMUn+jjMXCH6aHXi88HwQYMeAwww0GPgmahOfdkdlAVpQztMnJMTktTf47A=
+.yandex.ru	TRUE	/	TRUE	1823178394	ymex	1823178394.yrts.1791642394
+.yandex.ru	TRUE	/	TRUE	1823178447	yandex_login	pirner4444
+.yandex.ru	TRUE	/	TRUE	1826202447	Session_id	3:1791642446.5.0.1791642445856:MjYmMw:5319.1.2:1|1773749552.-1.20002.2:1.3:1791642446|3:12246007.118896.pOLfopqcJNfXjGqXSWubt4jqyu4
+.yandex.ru	TRUE	/	TRUE	1826202447	sessar	1.2118107.CiA7IuvvkdF7G3jpx5UFq5cU0xLoRn5rcJaFMLJsXcyXJg.Puu65DxHXLJ4aPs9mZaIffXcuSi8ifA-l_UYC-3IA14
+.yandex.ru	TRUE	/	TRUE	1826202447	sessionid2	3:1791642446.5.0.1791642445856:MjYmMw:5319.1.2:1|1773749552.-1.20002.2:1.3:1791642446|3:12246007.118896.fakesign0000000000000000000
+.passport.yandex.ru	TRUE	/	TRUE	1826202447	sessguard	1.1791642446.1791642445856:MjYmMw:5319..3.500:2246103.O36IFKWl.Y43jdHJNfC8mIIakawYB-XpdB7Y
+.yandex.ru	TRUE	/	FALSE	1826202447	L	UwkDQllSBndGB3BbXWdjW3BOXAEMcw5sOgA+BgkZWAB/BA==.1791642446.2234944.35458.fa271369e099d51e5dccad9e3d525ec3
+.passport.yandex.ru	TRUE	/	TRUE	1826202447	lah	2:1854714446.12246037.mOTD-KnxGEl-aotT.VE4xpFzX1tRURfhQFg-aKm11xdOjoTx6lEjN.7I5eJrn2ws7S7Ho4YyJ0pw
+.passport.yandex.ru	TRUE	/	TRUE	1826202447	mda2_beacon	1791642446250
+.passport.yandex.ru	TRUE	/	TRUE	1826202454	mda2_domains	dzen.ru,ya.ru
+.ya.ru	TRUE	/	TRUE	1826202455	Session_id	3:1791642453.5.0.1791642445856:MjYmMw:5319.1.2:1|1773749552.-1.20002.2:1.3:1791642446|6:12246010.611695.8ZbrhqSoKh0Ia-0isH_hImIqq2g
+.ya.ru	TRUE	/	TRUE	1826202455	sessar	1.2118107.CiB2Umjf2MfFEzeZ2u0UfLp3HlVFbvsYiKBv3NJwS5Ubog.nbXdtSdsuwSdbzhDB3VIiggMgP4o7AnIh9iR0KYdAhk
+.ya.ru	TRUE	/	TRUE	1823178455	yandex_login	pirner4444
+.ya.ru	TRUE	/	TRUE	1826202455	yp	2107002453.udn.cDpwaXJuZXI0NDQ0
+.ya.ru	TRUE	/	TRUE	1826202455	i	HyjBuQL9O5ZFm5vmoPj1Rqo9/y16n/6cXMUn+jjMXCH6aHXi88HwQYMeAwww0GPgmahOfdkdlAVpQztMnJMTktTf47A=
+.ya.ru	TRUE	/	TRUE	1826202455	yandexuid	1201934391791292755
+.ya.ru	TRUE	/	FALSE	1826202455	L	UwkDQllSBndGB3BbXWdjW3BOXAEMcw5sOgA+BgkZWAB/BA==.1791642446.2234944.35458.fa271369e099d51e5dccad9e3d525ec3
+.ya.ru	TRUE	/	TRUE	1826202455	mda2_beacon	1791642453764
+.ya.ru	TRUE	/	TRUE	1826202455	_yasc	5HH+tmFMZwznAh+IyT9vn1hBHwJfMRSjSERiALsS8UzJxTw9v+CDOzPVDvajBfiLxAoq
+.google.com	TRUE	/	FALSE	1826202591	SID	g.a000Dgl_0nLlcLDOCZ9uh9ozkjhPvwKOj3rYJefKWUqE6VfIH1xVQURdZmuC1IiTrnJlXGyuBAACgYKAYwSARQSFQHGX2MioLpDMWTllUdJKXJCtXuOJBoVAUF8yKoXsNI4H9hzYbk137M9qvzm0076
+.google.com	TRUE	/	TRUE	1826202591	__Secure-1PSID	g.a000Dgl_0nLlcLDOCZ9uh9ozkjhPvwKOj3rYJefKWUqE6VfIH1xVKXYxQfIGFMaOwRxhkFjzAAACgYKAR4SARQSFQHGX2Miz4zOo2oMHLHLun13zHH9ZBoVAUF8yKq7PhboiObjqkVbRZuQuqnw0076
+.google.com	TRUE	/	TRUE	1826202591	__Secure-3PSID	g.a000Dgl_0nLlcLDOCZ9uh9ozkjhPvwKOj3rYJefKWUqE6VfIH1xVcXv-tIEoyBosco3rBBeRaQACgYKAeoSARQSFQHGX2MiUrGO77_FiAPU4ndEXie_KRoVAUF8yKqjLqQhYdn_YltmgRpcT2-00076
+.google.com	TRUE	/	FALSE	1826202591	HSID	AAyxw9HOwsdJYR-GS
+.google.com	TRUE	/	TRUE	1826202591	SSID	AtZIiHdBzNcI82gmz
+.google.com	TRUE	/	FALSE	1826202591	APISID	cbq1wv2kuJ5QtNkL/A4TfDmS6yHMZo5UB6
+.google.com	TRUE	/	TRUE	1826202591	SAPISID	XQxa1PIqrV_tr1OQ/AE3KXbZSTW6C9NLNE
+.google.com	TRUE	/	TRUE	1826202591	__Secure-1PAPISID	XQxa1PIqrV_tr1OQ/AE3KXbZSTW6C9NLNE
+.google.com	TRUE	/	TRUE	1826202591	__Secure-3PAPISID	XQxa1PIqrV_tr1OQ/AE3KXbZSTW6C9NLNE
+accounts.google.com	FALSE	/	TRUE	1826202591	SMSV	ADHTe-DiNPzofqn0JHouB6VtfhvtgbK_qtuHvh9Vfq_fv50d0HjEz4uxCPB_FUxn7JS0casy_AAyz2WzUgu1UJufz6GILMo4JNE0kn11TQCZs4hlAFM0Ac0
+accounts.google.com	FALSE	/	TRUE	1826202591	LSID	s.FR|s.youtube:g.a000Dgl_0jiEOjj1_jlxTEarniiSkPfFA_x2WjbvD9gaO_xm7FdlmfdzEp5m7KlfrO8_TxnjKAACgYKAUkSARQSFQHGX2MiP-PtBnLYXrIECP4NBcA5JBoVAUF8yKos6rN_Qlh0m88D6NkPlEJI0076
+accounts.google.com	FALSE	/	TRUE	1826202591	__Host-1PLSID	s.FR|s.youtube:g.a000Dgl_0jiEOjj1_jlxTEarniiSkPfFA_x2WjbvD9gaO_xm7FdlgwkQ2NtejevUvRXkD9Vd0gACgYKAfESARQSFQHGX2MiV_qLpUr4cV20MXUDDuTWMBoVAUF8yKrXiIhyJXaTrbwx99FZs3hP0076
+accounts.google.com	FALSE	/	TRUE	1826202591	__Host-3PLSID	s.FR|s.youtube:g.a000Dgl_0jiEOjj1_jlxTEarniiSkPfFA_x2WjbvD9gaO_xm7FdlMF4FRJJ3JYeOitlIuFa_dwACgYKAQASARQSFQHGX2MiXiArADSbjS1_vxW3KFkNHRoVAUF8yKqEz8y0OKl-S6OV9l5hNpN20076
+accounts.google.com	FALSE	/	TRUE	1826202591	ACCOUNT_CHOOSER	AFx_qI67EvocGgPg66jW3nk6RUHqX96joWNrmcXI8bXz-qSdQ0yqZNigJo5v4dHHycmCjQqOB3kgpRDaFN7BxxWWyqveVxHj_6PzfabCa8uHyOKbBJHY23V2AcbreIl9D6uAm8CbRviKwXz07veHM6d7C_noQD6K8w
+.youtube.com	TRUE	/	FALSE	1826202592	HSID	APElUt-8zdG_cCDoz
+.youtube.com	TRUE	/	TRUE	1826202592	SSID	AlICS8T_fF38Iwme6
+.youtube.com	TRUE	/	FALSE	1826202592	APISID	cbq1wv2kuJ5QtNkL/A4TfDmS6yHMZo5UB6
+.youtube.com	TRUE	/	TRUE	1826202592	SAPISID	XQxa1PIqrV_tr1OQ/AE3KXbZSTW6C9NLNE
+.youtube.com	TRUE	/	TRUE	1826202592	__Secure-1PAPISID	XQxa1PIqrV_tr1OQ/AE3KXbZSTW6C9NLNE
+.youtube.com	TRUE	/	TRUE	1826202592	__Secure-3PAPISID	XQxa1PIqrV_tr1OQ/AE3KXbZSTW6C9NLNE
+.youtube.com	TRUE	/	FALSE	1826202592	SID	g.a000Dgl_0nLlcLDOCZ9uh9ozkjhPvwKOj3rYJefKWUqE6VfIH1xVQURdZmuC1IiTrnJlXGyuBAACgYKAYwSARQSFQHGX2MioLpDMWTllUdJKXJCtXuOJBoVAUF8yKoXsNI4H9hzYbk137M9qvzm0076
+.youtube.com	TRUE	/	TRUE	1826202592	__Secure-1PSID	g.a000Dgl_0nLlcLDOCZ9uh9ozkjhPvwKOj3rYJefKWUqE6VfIH1xVKXYxQfIGFMaOwRxhkFjzAAACgYKAR4SARQSFQHGX2Miz4zOo2oMHLHLun13zHH9ZBoVAUF8yKq7PhboiObjqkVbRZuQuqnw0076
+.youtube.com	TRUE	/	TRUE	1826202592	__Secure-3PSID	g.a000Dgl_0nLlcLDOCZ9uh9ozkjhPvwKOj3rYJefKWUqE6VfIH1xVcXv-tIEoyBosco3rBBeRaQACgYKAeoSARQSFQHGX2MiUrGO77_FiAPU4ndEXie_KRoVAUF8yKqjLqQhYdn_YltmgRpcT2-00076
+.google.fr	TRUE	/	FALSE	1826202592	HSID	APElUt-8zdG_cCDoz
+.google.fr	TRUE	/	TRUE	1826202592	SSID	AlICS8T_fF38Iwme6
+.google.fr	TRUE	/	FALSE	1826202592	APISID	cbq1wv2kuJ5QtNkL/A4TfDmS6yHMZo5UB6
+.google.fr	TRUE	/	TRUE	1826202592	SAPISID	XQxa1PIqrV_tr1OQ/AE3KXbZSTW6C9NLNE
+.google.fr	TRUE	/	TRUE	1826202592	__Secure-1PAPISID	XQxa1PIqrV_tr1OQ/AE3KXbZSTW6C9NLNE
+.google.fr	TRUE	/	TRUE	1826202592	__Secure-3PAPISID	XQxa1PIqrV_tr1OQ/AE3KXbZSTW6C9NLNE
+.google.fr	TRUE	/	TRUE	1807453792	NID	CooCCAESvAEBOxGDSNGnIzP24ZBXSnOwRI_Z8AiYvzqVSB5z8ZnFQqiJbrPxdnO8HGasx4iL3dUxwKM-hew2Nu_aWg1myGXUiRpkMcYvbBAlDHhPIDDGlf2TCHUD3D7BgHS-5a5La2y7SM96B0gt96wsXPxw07LDi22XeEBNQjEcqTxTFBSob8qCtN7xt9SlaTPrE9pfUaqVIVmCZpkdDORI-dacdc0bi83WrMg9G-xwaHJzuBXY0dSazRF-njEwf2ztuigBMkUB0qwHz5XcS228e4CLVN_Y4h4r8wJpsbBMQ8Q_WKlw6eK33o6f0g9_KQf7Kp7DGns6HCq4lsYpdJQB9LI3HuBKP9R0HQs
+.google.fr	TRUE	/	FALSE	1826202592	SID	g.a000Dgl_0nLlcLDOCZ9uh9ozkjhPvwKOj3rYJefKWUqE6VfIH1xVQURdZmuC1IiTrnJlXGyuBAACgYKAYwSARQSFQHGX2MioLpDMWTllUdJKXJCtXuOJBoVAUF8yKoXsNI4H9hzYbk137M9qvzm0076
+.google.fr	TRUE	/	TRUE	1826202592	__Secure-1PSID	g.a000Dgl_0nLlcLDOCZ9uh9ozkjhPvwKOj3rYJefKWUqE6VfIH1xVKXYxQfIGFMaOwRxhkFjzAAACgYKAR4SARQSFQHGX2Miz4zOo2oMHLHLun13zHH9ZBoVAUF8yKq7PhboiObjqkVbRZuQuqnw0076
+.google.fr	TRUE	/	TRUE	1826202592	__Secure-3PSID	g.a000Dgl_0nLlcLDOCZ9uh9ozkjhPvwKOj3rYJefKWUqE6VfIH1xVcXv-tIEoyBosco3rBBeRaQACgYKAeoSARQSFQHGX2MiUrGO77_FiAPU4ndEXie_KRoVAUF8yKqjLqQhYdn_YltmgRpcT2-00076
+.bing.com	TRUE	/	TRUE	1826202646	USRLOC	HS=1&ELOC=LAT=50.688720703125|LON=3.184250831604004|N=%D0%A0%D1%83%D0%B1%D0%B5%2C%20%D0%9E-%D0%B4%D0%B5-%D0%A4%D1%80%D0%B0%D0%BD%D1%81|ELT=1|&CLOC=LAT=48.5829|LON=7.7437|A=50000|TS=261012042741|SRC=I&BID=MjYxMDEyMTEyNzQxX2RjMGYyNTFkOWY0YjMwNGM3ODNiM2MzNjlkM2MxOGE0YTNhYWZhMDhiYTM3MWVkNmU0ZGIzZGE3M2U4N2M2MzM=
+.login.live.com	TRUE	/	TRUE	1825338651	MSCC	51.38.54.50-FR
+.yandex.ru	TRUE	/	TRUE	1823254908	_ym_d	1791718908
+.softonic.ru	TRUE	/	TRUE	1793014915	_swo_pos	225
+.softonic.ru	TRUE	/	TRUE	1794310917	utm	medium=organic
+.softonic.ru	TRUE	/	FALSE	1823341316	didomi_token	eyJ1c2VyX2lkIjoiMWExMmFjNTAtMjVlZC02ZTIzLWE2NjUtMTIyMTE4ZWMzNzNlIiwiY3JlYXRlZCI6IjIwMjYtMTAtMTFUMTE6NDE6NTYuNzAyWiIsInVwZGF0ZWQiOiIyMDI2LTEwLTExVDExOjQxOjU2LjcwMloiLCJ2ZXJzaW9uIjpudWxsfQ==
+.yandex.ru	TRUE	/	TRUE	1826280593	pcuid_context	5122998331791720592
+.vk.com	TRUE	/	TRUE	1823596998	remixlang	0
+.youtube.com	TRUE	/	TRUE	1826280945	LOGIN_INFO	AFmmF2swRQIgfyhFid0qHqDavVC79EONMKk_S9u4eu2JEiu3S7nw7gsCIQD1qL6tcsgg7n_Br2A9aQRg3-jrYa5bwOEAtkKFf-2k3A:QUQ3MjNmeW9pYmFJZXFnUGlFUVpoNFN0cGRZcjF5cXBXVGdUZkpicklrU2NNNlBieXBSM01IQUdJT3NUMl81R1R3U0hUVU1ZanJ3OWRWNGNJY3VhenpndHFUT0xpYkEtcUJFTllIZVdjVFd5eHdoRk1nVXJSdzZEdlB2Qld2WWFYcmVDYkx2XzB0cUFqN1lNOFpGTGIwYzNYSGhTVzN2c3ZPWWlIVUs5NWZlMXNSR0VubjJfbTdXNjRwMXZKZWRSRzl3TS1LTlVwektLRl9lSWxIbHk5UU1kdGhYaEdpQlI0QQ==
+.googleadservices.com	TRUE	/	TRUE	1799497005	ar_debug	1
+.doubleclick.net	TRUE	/	TRUE	1807273005	APC	ATI4zw56o46VlqmaKfWgNMwMQn2i1SzVi70RlaIcPVIp5iqdrJ5-TA
+.adobe.com	TRUE	/	FALSE	1823257009	s_nr	1791721009647-New
+.adobe.com	TRUE	/	TRUE	1825849010	kndctr_9E1005A551ED61CA0A490D45_AdobeOrg_identity	CiYwODM4ODc2MjQ5MDg2NTc3NjMyMTQwNTg2Mzg4Njg2NDY3MzMyMVITCL3hk9eSNBABGAEqBElSTDEwAPABveGT15I0
+.adobe.com	TRUE	/	TRUE	1826281010	mbox	session%2308388762490865776321405863886864673321%2DmISELM%231791722869
+.adobe.com	TRUE	/	TRUE	1825417010	AMCV_9E1005A551ED61CA0A490D45%40AdobeOrg	MCMID|08388762490865776321405863886864673321
+idg.adobe.com	FALSE	/	TRUE	1795609074	idg_token	HGOkf1OnioUGpUjzHeSVn61h1H7nUlO7S8zuq5MFlPSE/dSoNPn2IGB92A2unFRS
+.services.adobe.com	TRUE	/	TRUE	1794140220	gds	eyJhbGciOiJSUzI1NiIsImtpZCI6Imltc19uYTEta2V5LWdjLTEiLCJpdHQiOiJjayJ9.eyJ0dGwiOjI0MTkyMDAsIm1vaSI6IjI3MWViMjY2IiwiZG9tYWluTWFya2VyIjoiLnNlcnZpY2VzLmFkb2JlLmNvbSIsImdkaSI6IjE3OTE3MjEwMTkwODdfODEzM2Y5OTgtMmJlZi00YzliLWExNzEtNTY1NTRjMTRkOTAzIiwiY2xpZW50X2lkIjoiYWNyb2JhdG1pbG8iLCJjcmVhdGVkX2F0IjoxNzkxNzIxMDE5LCJleHBpcmVzX2F0IjoxNzk0MTQwMjE5LCJmaW5nZXJwcmludF9kZXZpY2VfaWQiOiJkMDkwM2E1Mi1lMDgyLTRhOWYtYjIwNS03ZGZjMjc1Njk3NGIifQ.bK-eyoQ191NB-KSS03VjP2b5_NChwsgl6JTU5SPZqRp2jLZWqpPdXJCS-3-ukhT1_RWUT4IUCtP-EuT2HPvh4U10oVap2Jae-i98bDT9uCmIqGQparEYTPOuivKa226i85MI8I4xluTPpiqxap_CoovcIU6Ngm-CKp_Zwz5-BJBmIKDXKEADFGb0h_6GxzLLbcUqo7lNmqOBqXb0fE7y3eLL8U7q1fViHMpQ1EISIq6NfD7a8hY9_sxZ5wfXBjfZebKsMtG3YioNpoBF_NSmxx9ZoGVjbhZvN_sXZpGEOizgLUje7tb6kASTJLO1y22aJkBxsBzyGJfRCwACPyCg7A
+.adobe.com	TRUE	/	FALSE	1826284499	forterToken	7d3f5d172e154dfaa9cd28dc8b162ba1_1791721022212__UDF43-m4_31ck_eAUs6+8ec1k%3D-8322-v2
+.www.adobe.com	TRUE	/	FALSE	1826284499	forterToken	7d3f5d172e154dfaa9cd28dc8b162ba1_1791721022212__UDF43-m4_31ck_eAUs6+8ec1k%3D-8322-v2
+.adobe.com	TRUE	/	TRUE	1823260669	OptanonConsent	isGpcEnabled=0&datestamp=Sun+Oct+11+2026+20%3A17%3A49+GMT%2B0700+(%D0%9A%D1%80%D0%B0%D1%81%D0%BD%D0%BE%D1%8F%D1%80%D1%81%D0%BA%2C+%D1%81%D1%82%D0%B0%D0%BD%D0%B4%D0%B0%D1%80%D1%82%D0%BD%D0%BE%D0%B5+%D0%B2%D1%80%D0%B5%D0%BC%D1%8F)&version=202501.1.0&browserGpcFlag=0&isIABGlobal=false&hosts=&consentId=efadaa0c-f96a-45a5-8d2b-0e5804d120ad&interactionCount=1&isAnonUser=1&landingPath=https%3A%2F%2Fwww.adobe.com%2Ffr%2Facrobat%2Froc%2Fcampaign%2Fpdf-ai-tool.html%3Fttid%3Design%26sdid%3DSTLMLQFM%26mv%3Dsocial%26mv2%3Dpaidsoc%26gad_source%3D2%26gad_campaignid%3D24169568049%26gclid%3DCjwKCAjw56zWBhB0EiwAdPOQOZcUc655987pzO3kR27m3ZZl1ajVjY757qeqRW8gs6PidcHpDDUg5xoC3oIQAvD_BwE&groups=C0001%3A1%2CC0002%3A0%2CC0003%3A0%2CC0004%3A0
+www.bing.com	FALSE	/	TRUE	1791839722	__Host-XY	CfDJ8Pj64jZaZ_RFrelrus2TRAB0Hs6kQoDngdnLHFIotr8ggkXURlSnsTDUBH4HvfGp055uICfNL5nPdykW3w9nCA3okw8-i2q19Pz5PltB5-f_69VRpTxdcuSiRFQ2_3WFIHCOlrVJki1prHiKJnYtLHf_SIxv2YKSVvgjTCgtY-9I9XNF9-LlQ7xbWMCtS778aEUmijspDH4iAS6a8yp52YSI35mhZDfit6W4FfUGkWtdBN2AoENODk6FCglHi-65xiIfxICrLcLVJ07pDuE1vG4
+.bing.com	TRUE	/	TRUE	1825498311	SRCHHPGUSR	SRCHLANG=ru&IG=8B982AA5891A413B9E131F1CE61A3D74&PV=10.0.0&PREFCOL=0&BRW=XW&BRH=M&CW=1592&CH=776&SCW=1577&SCH=4127&DPR=1.0&UTC=420&P=CfDJ8Pj64jZaZ_RFrelrus2TRABecAkASCjEmdmnqYl3RCXYT74cSAki0AvoySENdtIw-AtqEc7QvKE5XUL6ABKYeEBTeZMug_MCtDyx3_GDlkTTZSEruqmzSwRUn4Bh6p08-y-b42ZTYhlCEJwhftzpozLo-az-R6AWG0SapcqmVC5VZTcVrLRs6pkgvRj1uDmFUw1&EXLTT=3&HV=1791642647&HVE=CfDJ8Pj64jZaZ_RFrelrus2TRABVZcckGbpC0kPGiDra16Jd-6ooQk1OVr5KYk_kXKyolBK2jjBeUmKlIt8XgpwiZvRoT1QpdCdJ1jV5ZTs1dQZvPLlyluX_s3fETY8SZvLGvh8mX_n-HlGQXrmNkYRLO-vV9l2cNj4FhBShJ9xBE8WUbvaIw6i9mmkT0mRObOTsCg&PRVCW=1592&PRVCH=774
+.msn.com	TRUE	/	TRUE	1794394310	lt	eyJhbGciOiJkaXIiLCJlbmMiOiJBMjU2Q0JDLUhTNTEyIiwia2lkIjoiLU9iNWZiZGE4aFduTmJpX2hjaWpWZzE4cFBCRGRFWXZWT3FCNjNYdjJBUSIsInppcCI6IkRFRiJ9..tDNmlpzZepBoB9psAB98IQ.d3PhErXKdtgFdyXjAdQ_XOBJcGqnR2t9NdaohxkG540wE4Pu3TFCpeHJ-h0eoUftGlWNQTKKRqXaQx9m55rxbuST5XL3GD31CXZVno4eJ4RXDVq2cNr8R-s6VWxjqEIdZQaan2n6O70M7hnj1_-vMboAAztKoG2smiRBtRDwjGyBKJ_LVaqLhWJ1Bod-zb5JPDMt5Namw5Vu-E2k4Z56nuk6P3hTl4dvE1L7GU_VPkSUBGBfnAnaw_GEzy3dak4-2Pfe9vMJknBbx0BTnt48rwsYezXLhDI8oBpBw5b0zw0vHBw1d6bTPj3p4iQDsJl3jFeZxGCnc6P_Ck-MiOfaK0vNz7QSH0ZjDyMVVV4B3IKR7N5C_aAyoJC2JR3F46rNKxxaAyoX8YYgFnLCO2xvopn1E6NIcE9AXdvz4RYSo8QzGKOCJALbanof2VSeZNL7EV1SneO8aQodbqW4TtQQjeRTRSW8Ja35hm576igDx4hzTmQh4m5PwEp6gvDbf8oUSgSqWys3WgTxP8UYinuZPC501vQAvoC0tP6AM1yUQh-QMllg6t85MQ8WW7j4c0QmFxKb5iWJ1jwiMIJcMiBnkbhgYFwD2GaMrLXMLtozwhJ_fIVYH543S4VXnvdS1lRYZULxxMojk6tkbsyDMqUTICHHR1aWq_72i7IGpGwhu7vafSOpnRSMBHN58LrXh_AXTt5E0LaNgVCI-60m2xVeLuX0-6K_SSVd6cMUIa7-A9iTnX4FXwkTzIZm4YfKyjSREEQ7QLm_4oqO7a7_f9Xcxo4clN1bMpJlk-hHyt4qT7GtJY2taEYksRLUG6zVIlOpgyNDCPmBTP29-cjm2hIZKNXPRFyfxfpMP7pxJ9sEv4per0Wg_P9-nFL7k-BeVpvg9nFkIYKATI6gT5rBlomyq8rX1eQZ9BrubNMTueoRlNMs83e1GbSzTw8WMoHZtnyBV0KpfJH_57eLfJ-UgSA404x8k8uBIGTUl4IYWjmmmZzSyVuNlbuLo5UKgutR1dnEvsBG6ngH5udRSo7hJPuMVXwi5o2yOb0GpkXv1uziCu2YGNMfVUNw9Nbi3rxnDQP2Aelw7WzIDefGJTbKdPSNve6ot4peaPB4LY0_xTgAFdyP21YomS43u32uPNCDvMY5gMoHvosQSe2IcEtKvS-frgW8FHyIvWPI8NfFQ5-XIg3f5kbI108HgHCfokEV8nTgTD3pS8mX9s7dz5CNDBQvUNrO-_VShsaHFfYNfXVoYHh2fmOWopQtqVILS4K-oT1TlLb5eZEZWFyvKV8-Gm1LuvOhyC3VxPl1M6gqOdh94_fgI-Ej4PkUeXf8Rg5lTsh6iAopSN27bV3cF4Wz1sUahf2YpRJsjdYO6U8stVQUm2Dcy4eNxkKyfqiP0m1K_RE_NIzAQNtsoVp6T9ADaGxx_MRTQbHL5_1gny_RzO9ccahr4N0luX6uQsZrZ2Mzx-az.1-4KGc26cldqKkPSV0LtqoMAkjHpPnTFsPZggsserq8
+.msn.com	TRUE	/	TRUE	1792378168	App-User	%7B%22userId%22%3A%22a-5158A609841166B2981CC7BDFFFFFFFF%22%2C%22cohorts%22%3A%5B%7B%22name%22%3A%22SuperCold%22%2C%22everSelected%22%3Afalse%2C%22reason%22%3A%22MatchedBySignal%22%7D%5D%2C%22accountType%22%3A%22MSA%22%2C%22identityType%22%3A%22App%22%2C%22settings%22%3A%7B%22userSettings%22%3A%7B%22rubyRefreshDaily%22%3A%220%22%7D%7D%2C%22responseCreationDateTime%22%3A%222026-10-12T02%3A49%3A25.5777746Z%22%2C%22debugId%22%3A%2285b5f7b1-2910-4d5e-a07c-618604c482a9%7C2026-10-12T02%3A49%3A25.5777781Z%7CAuth%7CNEU-CF%7Caksgen02000003%22%7D
+.dzen.ru	TRUE	/	FALSE	1791859768	front_fpid	cyQPFKm1_LB7taBlhyP9S
+.yandex.com	TRUE	/	TRUE	1826333373	yp	1791859771.yu.1201934391791292755
+.yandex.com	TRUE	/	TRUE	1823309371	ymex	1794365371.oyu.1201934391791292755#1823176100.yrts.1791640100#1823176100.yrtsi.1791640100
+.mc.yandex.com	TRUE	/	TRUE	1791859771	sync_cookie_ok	synced
+verify.yandex.ru	FALSE	/	TRUE	1791859780	adsrv_s_	33fc1f72db3cf487bc0
+.yandex.ru	TRUE	/	TRUE	1823309380	amcuid	6466418331791773378
+ntp.msn.com	FALSE	/	FALSE	1791859827	msaoptout	0
+.youtube.com	TRUE	/	TRUE	1825768109	__Secure-YENID	18.YTE=SzCdsNnd494IGIHJoq8fCi8tsyY_1fCFNzI-mmTuap5n_tyfWRXNNNfniHQt_7Jcbml2zgZAvMdaGPsKeCCSIAvKef8-0so5wz0t_gi8JcMBWvYb24MPJcZOAN3of7oX0cm81AlVZoPKzCyPT0O53um_J1WMlT3RsGh78HHJIYI28ENb5BvcbUxkSVPyV-uM9p5g0zJn66dEMRq8yhpOiqfRjfiMde6yODZ2MeVu1M_mo1xDtOKKOBMgbiwz8C6WIz5AURqdruAalLFTsZUgeTlgjMiFOz-PCHKyp-m75Yt1TshpQ_3_wMrNh0LGI152MO8xQxz2dbAdPO5baa4NPA
+.youtube.com	TRUE	/	TRUE	1807325491	__Secure-ROLLOUT_TOKEN	CJWiy_uj37LcVBDXhbm-y6-XAxiL0MWyvLOXAw%3D%3D
+.facebook.com	TRUE	/	TRUE	1826333519	oo	v1
+.facebook.com	TRUE	/	TRUE	1792379423	locale	ru_RU
+accounts.google.com	FALSE	/	TRUE	1826334650	__Host-GAPS	1:ID04hxF-JQc0UmVkopB0iQYOzvRV8dAQh-9VFOt_gh2yT60QRvDY-D1HLDCPW-Rt_0R78b880wAhB5_USgMl-sVVk62YhA:SKTUai2xK3Q3XH2f
+.google.com	TRUE	/	TRUE	1807585851	NID	Cv8CCAESsQIBOxGDSJGStYdPcddSiasChJepk47kO5hMmtEULyrOJMjnTplxbETFhcp2MkRDMeX9FzIWktIFAxk9OO6JGF_U52CsccAFDcacA96vCfiSNkWnyzgDvHfLDCXJD-jTW-itG8cVSBXq8z8jKc6US5yGq3pWOPa7LHl-MNyzSABVxpP_RPzrdFOFqU2NIVKPIpi0Zg0Vx1OS37-wEUSk6HdH5gnDtvGmDlAVgHohdAFr5qyzklKmrAIkaAs1QvwPnI9jig4z9Oq_8pprr7UyZ2VSdyBXOL7Ex8YZ5RFVy1o3P923iDuPAn3kMO5_fUoF70vVMTdPaTjWIMY1Ikq5ZGrKDH0wJo_K5o2nIpgHCiX99v3rEPQig6vZ8h_ZYvwbJXIqjLVly3u_o8mRoKTMrm8oJigBMkUB0qwHz9r32xOV3j5xUE4O99W1UC7SrauuUUPAj8daphN6V41BqBdBMu6_JOyg_Iqa9Zaffhjl1uFti65a2KPUleZVVw4
+.facebook.com	TRUE	/	TRUE	1823314606	c_user	100010271560418
+.google.com	TRUE	/	TRUE	1825479692	__Secure-ENID	Cp8CCAIS0QEBAQxeRco4FmwxAD9aoUaWvUuzB2qkoDpKDg_outsLSSThxXhWbvNfepZMAHzpBtcwZb0WhUr_lYWTfQmmj-g9kxG1Rvppwli_3xiaTSKASyx9f4s0LIRMCnJYdxpeWUMQUL7xLpiepu-rUeUBwL3WmJJfzCM4nBmsouhUoTsanqzUOfhIGt9G5-WTHKsiOfSQlLQ2uxMquHKnDqKRxbI-iCUlgtJfTU3JkrbJ8oY2LIoIonYfSXxm2iM2OkY2r50DBsvzLntyf2Q-0qyvyLo1AigCMkUBfWzEqkeS_78NZ7E0MFuvu_-Gfq7_KGrtmTyyECPuuL6TUI2NijfqW9lhNShvHSq2Yjuwi0qvjsshfuNvSNfBgDYKpQ4
+.google.com	TRUE	/	FALSE	1823310660	SIDCC	AKEyXzUcJqEE9z1V57xg4w8cq78hppMO7Q98ZWp9HdIaeWhiQBPAjwxuxSbj7fS8Mxecf1iJlg
+.google.com	TRUE	/	TRUE	1823310660	__Secure-1PSIDCC	AKEyXzV_Pe0ZKcRVGdkRJXTqS_ScVgKYKHd1YFMKeAHRbBF5-kkSMgc-AfYQXj3pvqlY2_8N
+.google.com	TRUE	/	TRUE	1823310660	__Secure-3PSIDCC	AKEyXzUtBAQEs8jhe_pi3Vq1Jj0IFmolDMnfbruNdwWXjtDZiry6p49YwwDMo2ei-tTe-fR38A
+.yandex.ru	TRUE	/	TRUE	1792984314	cycada	kNGQO6px33dYNBnWikVpqO1le2zmcBx7IQBDZ8y4DZA=
+dzen.ru	FALSE	/	FALSE	1791861543	tmr_detect	0%7C1791775143446
+.doubleclick.net	TRUE	/	TRUE	1807192109	APC	ATI4zw7Yc1gXKk0cV3HbdSPymTENcuv7BH83H2FQgGIdR9sgxEEWpw
+.doubleclick.net	TRUE	/	TRUE	1825416952	IDE	AHWqTUk82mn3NmSiKkvAGFb9jhjn5opC9wjwd-KN2PsTqk4ZoRGe5_Vg7ji8CIFcT8Y
+.archive.org	TRUE	/	FALSE	1823311201	donation-identifier	c1f46bb7d73fdb06739ad1827699eb36
+.facebook.com	TRUE	/	TRUE	1799554603	fr	0wXQ4bVa6sTIolVlY.AWfx0fytrBJ-M_-iz6jdYW9aOjagSHD_FLyy4aCUltQD3Fo10YI.BqzE_B..AAA.0.0.BqzF8o.AWckcxq3lLcDlbkRgZgc4wYd__s
+.facebook.com	TRUE	/	TRUE	1823314606	xs	39%3AN0Ld0BSJAQmHFQ%3A2%3A1791774652%3A-1%3A-1%3A%3AAcwxHKDKQc_2NYAAqj_qmjblEkguZMdrjZDWxw7G4Q
+.facebook.com	TRUE	/	TRUE	1792383407	wd	1600x828
+.instagram.com	TRUE	/	TRUE	1792407113	wd	1600x828
+.instagram.com	TRUE	/	TRUE	1826338693	oo	v1
+.sso.dzen.ru	TRUE	/	TRUE	1826339253	i	abCNIcXkc0KXxcHb+FTJ/Vvx3fYLyTcEXR9oB8ZC+NE5V3vxc8Ao2pyRF/zjwqpW4JHcZPFK/M0gkbvIKtD8RAJgKxQ=
+.yandex.ru	TRUE	/	TRUE	1826339253	bh	EkIiTWljcm9zb2Z0IEVkZ2UiO3Y9IjE1NSIsICJDaHJvbWl1bSI7dj0iMTU1IiwgIk5vdChBOkJyYW5kIjt2PSIyNCIaBSJ4ODYiIg8iMTU1LjAuNDI4My40NSIqAj8wMgIiIjoJIldpbmRvd3MiQggiMTAuMC4wIkoEIjY0IlJcIk1pY3Jvc29mdCBFZGdlIjt2PSIxNTUuMC40MjgzLjQ1IiwgIkNocm9taXVtIjt2PSIxNTUuMC44MDU5LjQwIiwgIk5vdChBOkJyYW5kIjt2PSIyNC4wLjAuMCJaAj8wYLPDsdYGaiHcyuH/CJLYobEDn8/h6gP7+vDnDev//fYPobXNhwiAwQM=
+.dzen.ru	TRUE	/	TRUE	1826339254	_yasc	+UaS525+Lxd5ww0oiGHlhbIqmuL5fbOlfVTH/FDX8HcIXdCd0RJxXhGrTkZVaC5nTnE/qn0=
+dzen.ru	FALSE	/	FALSE	1792384059	domain_sid	cyQPFKm1_LB7taBlhyP9S%3A1791779258596
+.yandex.com	TRUE	/	TRUE	1826339264	_yasc	iyhaT2By9FvctRqt4GL27ty1HSG8kqNJaNnRh4kO8Syc5v+wXbfYPiwRB2SixT9Aq8iiXfQ=
+.yandex.ru	TRUE	/	TRUE	1826339264	yp	2107002446.udn.cDpwaXJuZXI0NDQ0#2107139264.pcs.0#1792506456.dlp.3#1794234456.gph.225_124#1792247257.szm.1%3A1600x900%3A1576x776%3A15#1794320857.hdrc.0#1791794974.iapfr.1
+.yandex.ru	TRUE	/	TRUE	1826339264	_yasc	/0kYOWpfgH1eiBi3tK57Swy7LUUeNb6Q/4okUeIapDC2FHfiDEsHrQCOfSZMQKxIcSn2udwf0SR/TPghjjDItf6b5mjD6sxvb/exEwWXoEbC26xiOfXI
+.yandex.com	TRUE	/	TRUE	1826339263	bh	EkIiTWljcm9zb2Z0IEVkZ2UiO3Y9IjE1NSIsICJDaHJvbWl1bSI7dj0iMTU1IiwgIk5vdChBOkJyYW5kIjt2PSIyNCIaA3g4NiINMTU1LjAuNDI4My40NSoCPzA6CSJXaW5kb3dzIkIGMTAuMC4wSgI2NFJaIk1pY3Jvc29mdCBFZGdlIjt2PSIxNTUuMC40MjgzLjQ1IiwiQ2hyb21pdW0iO3Y9IjE1NS4wLjgwNTkuNDAiLCJOb3QoQTpCcmFuZCI7dj0iMjQuMC4wLjAiYL/DsdYGaiHcyuH/CJLYobEDn8/h6gP7+vDnDev//fYPobXNhwiAwQM=
+.youtube.com	TRUE	/	TRUE	1825768108	__Secure-YEC	CgtRaDZmVld1UTF5TSi_w7HWBjIoCgJGUhIiEh4SHAsMDg8QERITFBUWFxgZGhscHR4fICEiIyQlJicgbWLgAgrdAjE4LllURT1TekNkc05uZDQ5NElHSUhKb3E4ZkNpOHRzeVlfMWZDRk56SS1tbVR1YXA1bl90eWZXUlhOTk5mbmlIUXRfN0pjYm1sMnpnWkF2TWRhR1BzS2VDQ1NJQXZLZWY4LTBzbzV3ejB0X2dpOEpjTUJXdlliMjRNUEpjWk9BTjNvZjdvWDBjbTgxQWxWWm9QS3pDeVBUME81M3VtX0oxV01sVDNSc0doNzhISEpJWUkyOEVOYjVCdmNiVXhrU1ZQeVYtdU05cDVnMHpKbjY2ZEVNUnE4eWhwT2lxZlJqZmlNZGU2eU9EWjJNZVZ1MU1fbW8xeER0T0tLT0JNZ2Jpd3o4QzZXSXo1QVVScWRydUFhbExGVHNaVWdlVGxnak1pRk96LVBDSEt5cC1tNzVZdDFUc2hwUV8zX3dNck5oMExHSTE1Mk1POHhReHoyZGJBZFBPNWJhYTROUEE%3D
+.youtube.com	TRUE	/	TRUE	1823317348	__Secure-1PSIDTS	sidts-CjUBkldj_9P1tPUIzI0_Y0bWWibMC3P0xwlCbkoOGYHnkiagACophYOa1m-Zg9ZlET3B8GQuhBAA
+.youtube.com	TRUE	/	TRUE	1823317348	__Secure-3PSIDTS	sidts-CjUBkldj_9P1tPUIzI0_Y0bWWibMC3P0xwlCbkoOGYHnkiagACophYOa1m-Zg9ZlET3B8GQuhBAA
+.youtube.com	TRUE	/	FALSE	1823317548	SIDCC	AKEyXzWzVDhkLK6PP6hMesHVKAF95B-NH4Rk0UF6Jt1Ri8qw4F5NOlsa1RHu33UxO0AW1V1FNQ
+.youtube.com	TRUE	/	TRUE	1823317548	__Secure-1PSIDCC	AKEyXzX9gBHGvizfl9uqf57xiNaNZizcgjyHGONh7QKMAfQmMZyhoTe9ALqORPaYCmUuxPbA
+.youtube.com	TRUE	/	TRUE	1823317548	__Secure-3PSIDCC	AKEyXzWZbnPzLv6I8YzpAZfeU83EMWIjPeL-JnPNiBE6zIsx7GBGSEmrKVT6exUrxZIUISgJJw
+.bing.com	TRUE	/	TRUE	1791888711	.MSA.Auth	CfDJ8Pj64jZaZ_RFrelrus2TRAAB_6gBEf35aIvK1jBK3qLGb_81bvLmLfpC8nCtjlA7uThLWGGMs-9WIDiB2zGgEgReyJSFrSB_F63dw4J3Ho7osy8_rlyUB5XE0Ue_fsXfcSOluAgulmRS5Tsj3Z18AM--HID1iAtqoRg59qQUUwg-Te9yYh9eYJM6kmBIFKJ4HgU0-jPeliw_WTByYJO0ppibsqnYrovb_byzhRAqTavzOoXHkLeUzWvvjuwEyjkCVZGLpfOkGZT-GkvP6wZSv-6TlUIr0yIlnDJIeVGvMsb5ag_6mPFKnT92lWKn8_dW-L2VAu1mF3g33tfnMF80Tlvs5U6bL2YoyB1kntjLlJFAUh771Of9XexsZz0D5m562g
+.bing.com	TRUE	/	FALSE	0	_EDGE_S	SID=0C5FD796C68169331108C066C7ED6897
+.bing.com	TRUE	/	TRUE	0	WLS	C=00000000-0000-0000-53d3-fbf76c53317c&N=
+.bing.com	TRUE	/	TRUE	0	_SS	SID=0C5FD796C68169331108C066C7ED6897
+.bing.com	TRUE	/	TRUE	1793011911	_U	1dh3TH8GkjdPa6rBX95jT2yymvGqY86LfHiiRYkrae0wXRAWFCYR1fDoECoYVdnUadQTSMhIsf-qFRmD3tyd05jVrsFmYYmkMNjU3YCG3iZiNzG2y9TmUraU2hcWtNI832L6SipfDQ04bpddJ3620ys943vbjE1eXDMzgBesLYL3UN4ACvRswpdApb3GcThEvVIooECMQPEulsklPjS1RtrnoK3wzNhmPcHIiJceSAJI
+.instagram.com	TRUE	/	TRUE	1823338312	sessionid	64880769641%3AKEoz2dJQTGVR5g%3A23%3AAYkUB3cbIkMZAFHsDXtDJG6YAqRZ7YWpaFeLph2NGw
+.instagram.com	TRUE	/	TRUE	0	rur	RVA%2C17841464849240096%2C1793012466%3A01ff3d9e7923b6375d2320a921d3bd6997b38571df1f488dc2b924f23264ef1a3bfe454d
