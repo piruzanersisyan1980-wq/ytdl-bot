@@ -236,9 +236,11 @@ def ydl_options(url: str, kind: str, output_template: str) -> dict:
     elif platform == "youtube":
         opts["format"] = YOUTUBE_FORMATS.get(kind, YOUTUBE_FORMATS["best"])
         opts["merge_output_format"] = "mp4"
-    else:
-        # Instagram/Facebook обычно отдают готовую видеодорожку со звуком
-        opts["format"] = "best[ext=mp4]/best"
+     else:
+        # Instagram/Facebook: сортировка по разрешению и битрейту,
+        # чтобы выбиралась максимально качественная дорожка
+        opts["format"] = "bv*+ba/b"
+        opts["format_sort"] = ["res", "br"]
         opts["merge_output_format"] = "mp4"
 
     return opts
