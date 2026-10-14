@@ -747,11 +747,12 @@ async def download_and_send(update, ctx, url, requested_kind, via_callback=False
                             title=path.stem, caption="🎵 Готово!",
                         )
                     else:
-                        await ctx.bot.send_video(
-                            chat_id=chat_id, video=media,
-                            supports_streaming=True,
-                            caption=f"🎬 Готово! ({label})",
-                        )
+                        await ctx.bot.send_document(
+    chat_id=chat_id,
+    document=media,
+    filename=path.name,
+    caption=f"🎬 Готово! ({label})",
+)
 
                 success = True
                 try:
