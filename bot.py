@@ -7,6 +7,7 @@ import logging
 import tempfile
 import shutil
 import uuid
+import urllib.request
 from pathlib import Path
 from urllib.parse import urlsplit
 from threading import Thread
@@ -28,7 +29,7 @@ TOKEN          = os.getenv("BOT_TOKEN")
 MAX_SIZE_MB    = int(os.getenv("MAX_SIZE_MB", "48"))
 MAX_CONCURRENT = int(os.getenv("MAX_CONCURRENT", "2"))
 PROXY_URL      = os.getenv("PROXY_URL", "").strip()
-PROGRESS_EVERY = float(os.getenv("PROGRESS_EVERY", "3"))  # сек между обновлениями
+PROGRESS_EVERY = float(os.getenv("PROGRESS_EVERY", "3"))
 
 CHANNEL              = "@edrikevideo"
 CHANNEL_URL          = "https://t.me/edrikevideo"
@@ -81,7 +82,6 @@ PLATFORM_NAMES = {
 }
 
 
-# ---------- Ошибка ----------
 def unavailable_message() -> str:
     return (
         "🛑 Ошибка скачивания!\n"
@@ -108,6 +108,28 @@ def platform_from_url(url: str) -> str:
     if host == "facebook.com" or host.endswith(".facebook.com") or host.endswith(".fb.watch"):
         return "facebook"
     return "other"
+
+
+def fetch_thumb_bytes(url: str, platform: str):
+    if not url:
+        return None
+    try:
+        req = urllib.request.Request(
+            url, headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}
+        )
+        if PROXY_URL and platform == "youtube" and PROXY_URL.startswith("http"):
+            opener = urllib.request.build_opener(urllib.request.ProxyHandler({
+                "http": PROXY_URL,
+                "https": PROXY_URL,
+            }))
+        else:
+            opener = urllib.request.build_opener()
+        with opener.open(req, timeout=15) as resp:
+            data = resp.read()
+        return data if data else None
+    except Exception:
+        log.warning("Не удалось скачать превью: %s", url, exc_info=True)
+        return None
 
 
 # ---------- Подписка ----------
@@ -484,41 +506,53 @@ async def handle_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
     info_message = await update.message.reply_text("🔍 Получаю информацию…")
     loop = asyncio.get_running_loop()
+
+    info = None
     try:
         info = await asyncio.wait_for(
             loop.run_in_executor(None, extract_info_sync, url),
             timeout=40,
         )
     except asyncio.TimeoutError:
-        await info_message.edit_text(
-            "⏱ Не удалось получить данные за 40 секунд. "
-            "Возможно, сайт недоступен или прокси не отвечает."
-        )
-        return
+        log.warning("Таймаут при получении информации")
     except Exception:
-        await info_message.edit_text(unavailable_message())
-        return
+        log.warning("Не удалось получить информацию", exc_info=True)
 
-    title = truncate(info.get("title") or "Видео", 60)
-    uploader = truncate(info.get("uploader") or info.get("channel") or "", 40)
-    duration = format_duration(info.get("duration"))
+    if info:
+        title = truncate(info.get("title") or "Видео", 60)
+        uploader = truncate(info.get("uploader") or info.get("channel") or "", 40)
+        duration = format_duration(info.get("duration"))
+        lines = [f"{PLATFORM_NAMES[platform]}: {title}"]
+        if uploader: lines.append(f"👤 {uploader}")
+        if duration: lines.append(f"⏱ {duration}")
+    else:
+        lines = [f"{PLATFORM_NAMES[platform]}: видео"]
 
-    lines = [f"{PLATFORM_NAMES[platform]}: {title}"]
-    if uploader: lines.append(f"👤 {uploader}")
-    if duration: lines.append(f"⏱ {duration}")
     lines.append("")
     lines.append("Выберите качество:" if platform == "youtube" else "Выберите действие:")
     caption = "\n".join(lines)
     keyboard = YOUTUBE_MENU if platform == "youtube" else SOCIAL_MENU
 
     await info_message.delete()
-    thumb = info.get("thumbnail")
+
+    thumb = info.get("thumbnail") if info else None
+    thumb_bytes = None
     if thumb:
         try:
-            await update.message.reply_photo(photo=thumb, caption=caption, reply_markup=keyboard)
+            thumb_bytes = await loop.run_in_executor(
+                None, fetch_thumb_bytes, thumb, platform
+            )
+        except Exception:
+            log.warning("Не удалось подготовить превью", exc_info=True)
+
+    if thumb_bytes:
+        try:
+            await update.message.reply_photo(
+                photo=thumb_bytes, caption=caption, reply_markup=keyboard
+            )
             return
         except Exception:
-            log.exception("Не отправить превью")
+            log.warning("Не отправить превью, отправляю текстом")
 
     await update.message.reply_text(caption, reply_markup=keyboard)
 
@@ -589,7 +623,6 @@ async def download_and_send(update, ctx, url, requested_kind, via_callback=False
     await acquire_slot()
     success = False
     loop = asyncio.get_running_loop()
-    last_error = None
 
     try:
         for index, kind in enumerate(attempts):
@@ -662,7 +695,6 @@ async def download_and_send(update, ctx, url, requested_kind, via_callback=False
                 return
 
             except yt_dlp.utils.DownloadError as error:
-                last_error = error
                 log.warning("Формат %s недоступен: %s", kind, clean_error(error))
                 try:
                     await ctx.bot.delete_message(progress_msg.chat_id, progress_msg.message_id)
@@ -673,7 +705,6 @@ async def download_and_send(update, ctx, url, requested_kind, via_callback=False
             finally:
                 cleanup_file(path)
 
-        # Если дошли сюда — все форматы не подошли по размеру
         await ctx.bot.send_message(chat_id, unavailable_message(), reply_markup=REPLY_MENU)
 
     except yt_dlp.utils.DownloadError as error:
