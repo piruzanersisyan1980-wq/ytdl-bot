@@ -8,6 +8,7 @@ import tempfile
 import shutil
 import uuid
 import urllib.request
+import subprocess
 from pathlib import Path
 from urllib.parse import urlsplit
 from threading import Thread
@@ -30,6 +31,7 @@ MAX_SIZE_MB    = int(os.getenv("MAX_SIZE_MB", "48"))
 MAX_CONCURRENT = int(os.getenv("MAX_CONCURRENT", "2"))
 PROXY_URL      = os.getenv("PROXY_URL", "").strip()
 PROGRESS_EVERY = float(os.getenv("PROGRESS_EVERY", "3"))
+FIX_ASPECT     = os.getenv("FIX_ASPECT", "1") == "1"
 
 CHANNEL              = "@edrikevideo"
 CHANNEL_URL          = "https://t.me/edrikevideo"
@@ -61,6 +63,7 @@ elif LOCAL_COOKIES.exists():
 
 log.info("Cookies доступны: %s", bool(COOKIES_FILE and COOKIES_FILE.exists()))
 log.info("Прокси настроен: %s", bool(PROXY_URL))
+log.info("Правка пропорций: %s", FIX_ASPECT)
 
 # ---------- Платформы ----------
 PLATFORM_PATTERNS = [
@@ -170,8 +173,7 @@ REPLY_MENU = ReplyKeyboardMarkup(
     input_field_placeholder="Отправьте ссылку на видео",
 )
 
-# YouTube: то же меню качества
-YOUTUBE_MENU = InlineKeyboardMarkup([
+QUALITY_MENU = InlineKeyboardMarkup([
     [InlineKeyboardButton("🎬 1080p", callback_data="q:1080"),
      InlineKeyboardButton("🎬 720p",  callback_data="q:720")],
     [InlineKeyboardButton("🎬 480p",  callback_data="q:480"),
@@ -182,24 +184,14 @@ YOUTUBE_MENU = InlineKeyboardMarkup([
      InlineKeyboardButton("❌ Отмена", callback_data="q:cancel")],
 ])
 
-# Instagram/Facebook: то же меню качества (как у YouTube)
-SOCIAL_MENU = InlineKeyboardMarkup([
-    [InlineKeyboardButton("🎬 1080p", callback_data="q:1080"),
-     InlineKeyboardButton("🎬 720p",  callback_data="q:720")],
-    [InlineKeyboardButton("🎬 480p",  callback_data="q:480"),
-     InlineKeyboardButton("🎬 360p",  callback_data="q:360")],
-    [InlineKeyboardButton("⭐ Лучшее", callback_data="q:best"),
-     InlineKeyboardButton("🎵 MP3",    callback_data="q:audio")],
-    [InlineKeyboardButton("⬅️ Назад",  callback_data="q:back"),
-     InlineKeyboardButton("❌ Отмена", callback_data="q:cancel")],
-])
+YOUTUBE_MENU = QUALITY_MENU
+SOCIAL_MENU  = QUALITY_MENU
 
 QUALITY_LABELS = {
     "1080": "1080p", "720": "720p", "480": "480p",
     "360": "360p", "best": "лучшее качество", "audio": "MP3",
 }
 
-# YouTube: раздельные видео+аудиодорожки
 YOUTUBE_FORMATS = {
     "1080": "bv*[height<=1080]+ba/b[height<=1080]",
     "720":  "bv*[height<=720]+ba/b[height<=720]",
@@ -209,8 +201,6 @@ YOUTUBE_FORMATS = {
     "audio": "bestaudio/best",
 }
 
-# Instagram/Facebook: обычно один файл, выбираем по высоте кадра.
-# Вторая часть выражения ловит вертикальные Reels (там height до 1920).
 SOCIAL_FORMATS = {
     "1080": "best[height<=1080]/best[height<=1920]/best",
     "720":  "best[height<=720]/best[height<=1280]/best",
@@ -304,6 +294,52 @@ class ProgressHook:
             log.debug("Ошибка progress hook", exc_info=True)
 
 
+# ---------- Правка пропорций ----------
+def fix_aspect(path: Path) -> Path:
+    """Принудительно SAR=1:1 без перекодирования, чтобы телефон не растягивал."""
+    if not FIX_ASPECT:
+        return path
+    if path.suffix.lower() not in (".mp4", ".mkv", ".mov"):
+        return path
+
+    fixed = path.with_name(path.stem + "_sar.mp4")
+
+    # Попытка 1: без перекодирования, только метаданные
+    try:
+        subprocess.run(
+            ["ffmpeg", "-y", "-loglevel", "error", "-i", str(path),
+             "-c", "copy",
+             "-bsf:v", "h264_metadata=sample_aspect_ratio=1/1",
+             str(fixed)],
+            capture_output=True, timeout=60, check=True,
+        )
+        if fixed.exists() and fixed.stat().st_size > 0:
+            path.unlink(missing_ok=True)
+            return fixed
+    except Exception:
+        log.info("SAR-фикс без перекодирования не сработал, пробую перекодировать")
+        fixed.unlink(missing_ok=True)
+
+    # Попытка 2: перекодирование с setsar=1
+    try:
+        subprocess.run(
+            ["ffmpeg", "-y", "-loglevel", "error", "-i", str(path),
+             "-vf", "scale=trunc(iw/2)*2:trunc(ih/2)*2,setsar=1",
+             "-c:v", "libx264", "-preset", "veryfast", "-crf", "23",
+             "-c:a", "copy", "-movflags", "+faststart",
+             str(fixed)],
+            capture_output=True, timeout=600, check=True,
+        )
+        if fixed.exists() and fixed.stat().st_size > 0:
+            path.unlink(missing_ok=True)
+            return fixed
+    except Exception:
+        log.warning("Не удалось исправить пропорции", exc_info=True)
+        fixed.unlink(missing_ok=True)
+
+    return path
+
+
 # ---------- yt-dlp ----------
 def ydl_options(url: str, kind: str, output_template: str, hook=None) -> dict:
     platform = platform_from_url(url)
@@ -332,7 +368,6 @@ def ydl_options(url: str, kind: str, output_template: str, hook=None) -> dict:
         opts["format"] = YOUTUBE_FORMATS.get(kind, YOUTUBE_FORMATS["best"])
         opts["merge_output_format"] = "mp4"
     else:
-        # Instagram/Facebook: выбор по разрешению, сохраняем пропорции
         opts["format"] = SOCIAL_FORMATS.get(kind, SOCIAL_FORMATS["best"])
         opts["format_sort"] = ["res", "br"]
         opts["merge_output_format"] = "mp4"
@@ -357,6 +392,7 @@ def extract_info_sync(url: str) -> dict:
 
 
 def download_sync(url: str, kind: str, hook=None) -> Path:
+    platform = platform_from_url(url)
     job_dir = DOWNLOAD_DIR / uuid.uuid4().hex
     job_dir.mkdir(parents=True, exist_ok=True)
     template = str(job_dir / "%(title).100B [%(id)s].%(ext)s")
@@ -369,14 +405,22 @@ def download_sync(url: str, kind: str, hook=None) -> Path:
         mp3_files = list(job_dir.glob("*.mp3"))
         if mp3_files:
             return mp3_files[0]
-    if expected.exists():
-        return expected
 
-    candidates = [p for p in job_dir.iterdir()
-                  if p.is_file() and not p.name.endswith((".part", ".ytdl"))]
-    if candidates:
-        return max(candidates, key=lambda p: p.stat().st_size)
-    raise FileNotFoundError("После скачивания файл не найден")
+    result = expected if expected.exists() else None
+    if result is None:
+        candidates = [p for p in job_dir.iterdir()
+                      if p.is_file() and not p.name.endswith((".part", ".ytdl"))]
+        if candidates:
+            result = max(candidates, key=lambda p: p.stat().st_size)
+
+    if result is None:
+        raise FileNotFoundError("После скачивания файл не найден")
+
+    # Instagram/Facebook: правим SAR, иначе телефон растянет видео
+    if platform in ("instagram", "facebook"):
+        result = fix_aspect(result)
+
+    return result
 
 
 def cleanup_file(path):
@@ -466,7 +510,7 @@ async def cmd_help(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "Отправьте ссылку — бот покажет варианты скачивания.\n"
         "YouTube, Instagram, Facebook: 1080p / 720p / 480p / 360p / MP3.\n"
-        "Большие видео бот качает в пониженном качестве.",
+        "Для Instagram/Facebook пропорции корректируются автоматически.",
         reply_markup=REPLY_MENU,
     )
 
@@ -551,7 +595,7 @@ async def handle_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     lines.append("")
     lines.append("Выберите качество:")
     caption = "\n".join(lines)
-    keyboard = YOUTUBE_MENU if platform == "youtube" else SOCIAL_MENU
+    keyboard = QUALITY_MENU
 
     await info_message.delete()
 
@@ -638,7 +682,6 @@ async def download_and_send(update, ctx, url, requested_kind, via_callback=False
     elif requested_kind == "audio":
         attempts = ["audio"]
     else:
-        # Instagram/Facebook: понижаем разрешение, если файл не влез
         if requested_kind in SOCIAL_ORDER:
             start = SOCIAL_ORDER.index(requested_kind)
             attempts = SOCIAL_ORDER[start:]
