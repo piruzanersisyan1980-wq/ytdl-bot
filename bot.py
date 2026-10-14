@@ -119,8 +119,7 @@ def fetch_thumb_bytes(url: str, platform: str):
         )
         if PROXY_URL and platform == "youtube" and PROXY_URL.startswith("http"):
             opener = urllib.request.build_opener(urllib.request.ProxyHandler({
-                "http": PROXY_URL,
-                "https": PROXY_URL,
+                "http": PROXY_URL, "https": PROXY_URL,
             }))
         else:
             opener = urllib.request.build_opener()
@@ -171,6 +170,7 @@ REPLY_MENU = ReplyKeyboardMarkup(
     input_field_placeholder="Отправьте ссылку на видео",
 )
 
+# YouTube: то же меню качества
 YOUTUBE_MENU = InlineKeyboardMarkup([
     [InlineKeyboardButton("🎬 1080p", callback_data="q:1080"),
      InlineKeyboardButton("🎬 720p",  callback_data="q:720")],
@@ -182,11 +182,16 @@ YOUTUBE_MENU = InlineKeyboardMarkup([
      InlineKeyboardButton("❌ Отмена", callback_data="q:cancel")],
 ])
 
+# Instagram/Facebook: то же меню качества (как у YouTube)
 SOCIAL_MENU = InlineKeyboardMarkup([
-    [InlineKeyboardButton("🎬 Скачать видео", callback_data="q:best")],
-    [InlineKeyboardButton("🎵 MP3",           callback_data="q:audio")],
-    [InlineKeyboardButton("⬅️ Назад",         callback_data="q:back"),
-     InlineKeyboardButton("❌ Отмена",        callback_data="q:cancel")],
+    [InlineKeyboardButton("🎬 1080p", callback_data="q:1080"),
+     InlineKeyboardButton("🎬 720p",  callback_data="q:720")],
+    [InlineKeyboardButton("🎬 480p",  callback_data="q:480"),
+     InlineKeyboardButton("🎬 360p",  callback_data="q:360")],
+    [InlineKeyboardButton("⭐ Лучшее", callback_data="q:best"),
+     InlineKeyboardButton("🎵 MP3",    callback_data="q:audio")],
+    [InlineKeyboardButton("⬅️ Назад",  callback_data="q:back"),
+     InlineKeyboardButton("❌ Отмена", callback_data="q:cancel")],
 ])
 
 QUALITY_LABELS = {
@@ -194,12 +199,24 @@ QUALITY_LABELS = {
     "360": "360p", "best": "лучшее качество", "audio": "MP3",
 }
 
+# YouTube: раздельные видео+аудиодорожки
 YOUTUBE_FORMATS = {
     "1080": "bv*[height<=1080]+ba/b[height<=1080]",
     "720":  "bv*[height<=720]+ba/b[height<=720]",
     "480":  "bv*[height<=480]+ba/b[height<=480]",
     "360":  "bv*[height<=360]+ba/b[height<=360]",
     "best": "bv*+ba/b",
+    "audio": "bestaudio/best",
+}
+
+# Instagram/Facebook: обычно один файл, выбираем по высоте кадра.
+# Вторая часть выражения ловит вертикальные Reels (там height до 1920).
+SOCIAL_FORMATS = {
+    "1080": "best[height<=1080]/best[height<=1920]/best",
+    "720":  "best[height<=720]/best[height<=1280]/best",
+    "480":  "best[height<=480]/best",
+    "360":  "best[height<=360]/best",
+    "best": "best",
     "audio": "bestaudio/best",
 }
 
@@ -211,6 +228,8 @@ YOUTUBE_FALLBACKS = {
     "best": ["720", "480", "360", "audio"],
     "audio": [],
 }
+
+SOCIAL_ORDER = ["1080", "720", "480", "360", "best", "audio"]
 
 
 # ---------- Прогресс ----------
@@ -313,7 +332,8 @@ def ydl_options(url: str, kind: str, output_template: str, hook=None) -> dict:
         opts["format"] = YOUTUBE_FORMATS.get(kind, YOUTUBE_FORMATS["best"])
         opts["merge_output_format"] = "mp4"
     else:
-        opts["format"] = "bv*+ba/b"
+        # Instagram/Facebook: выбор по разрешению, сохраняем пропорции
+        opts["format"] = SOCIAL_FORMATS.get(kind, SOCIAL_FORMATS["best"])
         opts["format_sort"] = ["res", "br"]
         opts["merge_output_format"] = "mp4"
     return opts
@@ -445,7 +465,7 @@ async def cmd_help(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         return
     await update.message.reply_text(
         "Отправьте ссылку — бот покажет варианты скачивания.\n"
-        "YouTube: качество и MP3. Instagram/Facebook: видео или MP3.\n"
+        "YouTube, Instagram, Facebook: 1080p / 720p / 480p / 360p / MP3.\n"
         "Большие видео бот качает в пониженном качестве.",
         reply_markup=REPLY_MENU,
     )
@@ -529,7 +549,7 @@ async def handle_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         lines = [f"{PLATFORM_NAMES[platform]}: видео"]
 
     lines.append("")
-    lines.append("Выберите качество:" if platform == "youtube" else "Выберите действие:")
+    lines.append("Выберите качество:")
     caption = "\n".join(lines)
     keyboard = YOUTUBE_MENU if platform == "youtube" else SOCIAL_MENU
 
@@ -618,7 +638,12 @@ async def download_and_send(update, ctx, url, requested_kind, via_callback=False
     elif requested_kind == "audio":
         attempts = ["audio"]
     else:
-        attempts = ["best", "audio"]
+        # Instagram/Facebook: понижаем разрешение, если файл не влез
+        if requested_kind in SOCIAL_ORDER:
+            start = SOCIAL_ORDER.index(requested_kind)
+            attempts = SOCIAL_ORDER[start:]
+        else:
+            attempts = list(SOCIAL_ORDER)
 
     await acquire_slot()
     success = False
