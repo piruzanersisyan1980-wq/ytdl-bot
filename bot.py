@@ -793,17 +793,25 @@ def start_health_server():
         return
 
     class Handler(BaseHTTPRequestHandler):
-        def do_GET(self):
+        def _send_ok(self, with_body: bool):
             self.send_response(200)
             self.send_header("Content-Type", "text/plain; charset=utf-8")
+            self.send_header("Content-Length", "19")
             self.end_headers()
-            self.wfile.write(b"OK - bot is running")
+            if with_body:
+                self.wfile.write(b"OK - bot is running")
+
+        def do_GET(self):
+            self._send_ok(with_body=True)
+
+        def do_HEAD(self):
+            # UptimeRobot проверяет сервис методом HEAD
+            self._send_ok(with_body=False)
 
         def log_message(self, *_args):
             pass
 
     HTTPServer(("0.0.0.0", port), Handler).serve_forever()
-
 
 # ---------- Запуск ----------
 async def post_init(app: Application):
