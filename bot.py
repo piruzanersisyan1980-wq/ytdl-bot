@@ -1,4 +1,4 @@
-# bot.py — YouTube + Instagram + Facebook Telegram bot
+# bot.py — YouTube + Instagram + Facebook + VK Telegram bot
 import os
 import re
 import time
@@ -31,7 +31,7 @@ MAX_SIZE_MB    = int(os.getenv("MAX_SIZE_MB", "48"))
 MAX_CONCURRENT = int(os.getenv("MAX_CONCURRENT", "2"))
 PROXY_URL      = os.getenv("PROXY_URL", "").strip()
 PROGRESS_EVERY = float(os.getenv("PROGRESS_EVERY", "3"))
-FIX_ASPECT     = os.getenv("FIX_ASPECT", "1") == "1"
+FIX_ASPECT     = os.getenv("FIX_ASPECT", "0") == "1"
 
 CHANNEL              = "@edrikevideo"
 CHANNEL_URL          = "https://t.me/edrikevideo"
@@ -76,12 +76,16 @@ PLATFORM_PATTERNS = [
     ("facebook", re.compile(
         r"https?://(?:(?:www|m|web|ru-ru)\.)?(?:facebook\.com|fb\.watch|fb\.com)/[\w\-?=&/%.]+",
         re.IGNORECASE)),
+    ("vk", re.compile(
+        r"https?://(?:(?:m|new)\.)?(?:vk\.com|vkvideo\.ru|vk\.ru)/[\w\-?=&/%.]+",
+        re.IGNORECASE)),
 ]
 
 PLATFORM_NAMES = {
     "youtube": "▶️ YouTube",
     "instagram": "📸 Instagram",
     "facebook": "📘 Facebook",
+    "vk": "🅥 VK",
 }
 
 
@@ -110,6 +114,8 @@ def platform_from_url(url: str) -> str:
         return "instagram"
     if host == "facebook.com" or host.endswith(".facebook.com") or host.endswith(".fb.watch"):
         return "facebook"
+    if host == "vk.com" or host.endswith(".vk.com") or host.endswith("vkvideo.ru") or host.endswith("vk.ru"):
+        return "vk"
     return "other"
 
 
@@ -186,6 +192,7 @@ QUALITY_MENU = InlineKeyboardMarkup([
 
 YOUTUBE_MENU = QUALITY_MENU
 SOCIAL_MENU  = QUALITY_MENU
+VK_MENU      = QUALITY_MENU
 
 QUALITY_LABELS = {
     "1080": "1080p", "720": "720p", "480": "480p",
@@ -201,6 +208,17 @@ YOUTUBE_FORMATS = {
     "audio": "bestaudio/best",
 }
 
+# VK часто отдаёт отдельные видео- и аудиодорожки (HLS/DASH)
+VK_FORMATS = {
+    "1080": "bv*[height<=1080]+ba/b[height<=1080]",
+    "720":  "bv*[height<=720]+ba/b[height<=720]",
+    "480":  "bv*[height<=480]+ba/b[height<=480]",
+    "360":  "bv*[height<=360]+ba/b[height<=360]",
+    "best": "bv*+ba/b",
+    "audio": "bestaudio/best",
+}
+
+# Instagram/Facebook: обычно одна готовая дорожка с аудио
 SOCIAL_FORMATS = {
     "1080": "best[height<=1080]/best[height<=1920]/best",
     "720":  "best[height<=720]/best[height<=1280]/best",
@@ -304,7 +322,6 @@ def fix_aspect(path: Path) -> Path:
 
     fixed = path.with_name(path.stem + "_sar.mp4")
 
-    # Попытка 1: без перекодирования, только метаданные
     try:
         subprocess.run(
             ["ffmpeg", "-y", "-loglevel", "error", "-i", str(path),
@@ -320,7 +337,6 @@ def fix_aspect(path: Path) -> Path:
         log.info("SAR-фикс без перекодирования не сработал, пробую перекодировать")
         fixed.unlink(missing_ok=True)
 
-    # Попытка 2: перекодирование с setsar=1
     try:
         subprocess.run(
             ["ffmpeg", "-y", "-loglevel", "error", "-i", str(path),
@@ -366,6 +382,9 @@ def ydl_options(url: str, kind: str, output_template: str, hook=None) -> dict:
         }]
     elif platform == "youtube":
         opts["format"] = YOUTUBE_FORMATS.get(kind, YOUTUBE_FORMATS["best"])
+        opts["merge_output_format"] = "mp4"
+    elif platform == "vk":
+        opts["format"] = VK_FORMATS.get(kind, VK_FORMATS["best"])
         opts["merge_output_format"] = "mp4"
     else:
         opts["format"] = SOCIAL_FORMATS.get(kind, SOCIAL_FORMATS["best"])
@@ -416,8 +435,7 @@ def download_sync(url: str, kind: str, hook=None) -> Path:
     if result is None:
         raise FileNotFoundError("После скачивания файл не найден")
 
-    # Instagram/Facebook: правим SAR, иначе телефон растянет видео
-    if platform in ("instagram", "facebook"):
+    if platform in ("instagram", "facebook", "vk"):
         result = fix_aspect(result)
 
     return result
@@ -496,7 +514,8 @@ async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     cookies_note = "есть" if COOKIES_FILE and COOKIES_FILE.exists() else "нет"
     proxy_note = "включён для YouTube" if PROXY_URL else "выключен"
     await update.message.reply_text(
-        "👋 Привет! Отправьте ссылку на YouTube, Instagram или Facebook.\n\n"
+        "👋 Привет! Отправьте ссылку на видео из:\n"
+        "▶️ YouTube  •  📸 Instagram  •  📘 Facebook  •  🅥 VK\n\n"
         f"Лимит Telegram: около {MAX_SIZE_MB} МБ.\n"
         f"Cookies: {cookies_note}.\n"
         f"Прокси: {proxy_note}.",
@@ -508,9 +527,14 @@ async def cmd_help(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not await require_subscription(update, ctx):
         return
     await update.message.reply_text(
-        "Отправьте ссылку — бот покажет варианты скачивания.\n"
-        "YouTube, Instagram, Facebook: 1080p / 720p / 480p / 360p / MP3.\n"
-        "Для Instagram/Facebook пропорции корректируются автоматически.",
+        "Отправьте ссылку — покажу доступные варианты качества.\n\n"
+        "Поддерживаются:\n"
+        "• YouTube — видео, Shorts\n"
+        "• Instagram — Reels, посты\n"
+        "• Facebook — видео, fb.watch\n"
+        "• VK — видео, клипы\n\n"
+        "Качество: 1080p / 720p / 480p / 360p / MP3.\n"
+        "Большие видео автоматически понижаются по размеру.",
         reply_markup=REPLY_MENU,
     )
 
@@ -560,7 +584,8 @@ async def handle_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     platform, url = detect_platform(text)
     if not platform:
         await update.message.reply_text(
-            "Не распознал ссылку. Поддерживаются YouTube, Instagram и Facebook.",
+            "Не распознал ссылку.\n"
+            "Поддерживаются: YouTube, Instagram, Facebook, VK.",
             reply_markup=REPLY_MENU,
         )
         return
@@ -747,12 +772,11 @@ async def download_and_send(update, ctx, url, requested_kind, via_callback=False
                             title=path.stem, caption="🎵 Готово!",
                         )
                     else:
-                        await ctx.bot.send_document(
-    chat_id=chat_id,
-    document=media,
-    filename=path.name,
-    caption=f"🎬 Готово! ({label})",
-)
+                        await ctx.bot.send_video(
+                            chat_id=chat_id, video=media,
+                            supports_streaming=True,
+                            caption=f"🎬 Готово! ({label})",
+                        )
 
                 success = True
                 try:
@@ -805,13 +829,13 @@ def start_health_server():
             self._send_ok(with_body=True)
 
         def do_HEAD(self):
-            # UptimeRobot проверяет сервис методом HEAD
             self._send_ok(with_body=False)
 
         def log_message(self, *_args):
             pass
 
     HTTPServer(("0.0.0.0", port), Handler).serve_forever()
+
 
 # ---------- Запуск ----------
 async def post_init(app: Application):
