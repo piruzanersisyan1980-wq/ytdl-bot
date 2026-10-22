@@ -372,14 +372,20 @@ def watermark_sync(src):
 # ---------- yt-dlp ----------
 def base_opts(url):
     p = platform_from_url(url)
-    o = {
+        o = {
         "noplaylist": True,
         "quiet": True,
         "no_warnings": True,
-        "retries": 3,
-        "socket_timeout": 20,
-        # Решатель JS-челленджей YouTube (n challenge, signature)
+        "retries": 5,
+        "socket_timeout": 60,
+        "extractor_retries": 5,
+        "file_access_retries": 5,
         "remote_components": ["ejs:github"],
+        "extractor_args": {
+            "youtube": {
+                "player_client": ["web_embedded", "tv_embedded", "default"],
+            },
+        },
     }
     if COOKIES_FILE and COOKIES_FILE.exists():
         o["cookiefile"] = str(COOKIES_FILE)
