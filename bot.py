@@ -2,9 +2,6 @@
 # + закладки + share + админ-панель + авто-дайджест + поиск + inline
 # + обрезка + субтитры + рефералка + QR + TTS + конвертер + водяной знак
 import os
-import sys
-import signal
-from types import SimpleNamespace
 import re
 import time
 import json
@@ -19,8 +16,7 @@ from pathlib import Path
 from urllib.parse import urlsplit, quote
 from threading import Thread
 from http.server import BaseHTTPRequestHandler, HTTPServer
-from datetime import datetime, timezone, timedelta
-from contextlib import suppress
+from datetime import datetime, timezone
 
 import yt_dlp
 import qrcode
@@ -39,11 +35,11 @@ from telegram.ext import (
 # ========== Настройки ==========
 TOKEN          = os.getenv("BOT_TOKEN")
 MAX_SIZE_MB    = int(os.getenv("MAX_SIZE_MB", "48"))
-MAX_CONCURRENT = max(1, int(os.getenv("MAX_CONCURRENT", "2")))
+MAX_CONCURRENT = int(os.getenv("MAX_CONCURRENT", "2"))
 PROXY_URL      = os.getenv("PROXY_URL", "").strip()
 PROGRESS_EVERY = float(os.getenv("PROGRESS_EVERY", "3"))
 FIX_ASPECT     = os.getenv("FIX_ASPECT", "0") == "1"
-REF_GOAL       = max(1, int(os.getenv("REF_GOAL", "3")))
+REF_GOAL       = int(os.getenv("REF_GOAL", "3"))
 WATERMARK      = os.getenv("WATERMARK", "@edrikevideo")
 FONT_PATH      = os.getenv("FONT_PATH", "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf")
 MAX_UPLOAD_MB  = 20
@@ -57,34 +53,14 @@ ADMIN_ID     = int(os.getenv("ADMIN_ID", "0"))
 
 DOWNLOAD_DIR = Path(tempfile.gettempdir()) / "ytdl_bot"
 DOWNLOAD_DIR.mkdir(parents=True, exist_ok=True)
-# DATA_DIR must point to a mounted persistent disk to survive redeployments.
-DATA_DIR = Path(os.getenv("DATA_DIR", tempfile.gettempdir()))
-DATA_DIR.mkdir(parents=True, exist_ok=True)
-REF_FILE = DATA_DIR / "ytdl_refs.json"
-BK_FILE = DATA_DIR / "ytdl_bookmarks.json"
-
-
-def atomic_write_json(path, data):
-    temp = path.with_name(path.name + "." + uuid.uuid4().hex + ".tmp")
-    try:
-        temp.write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
-        os.replace(temp, path)
-    finally:
-        temp.unlink(missing_ok=True)
+REF_FILE = Path(tempfile.gettempdir()) / "ytdl_refs.json"
+BK_FILE  = Path(tempfile.gettempdir()) / "ytdl_bookmarks.json"
 
 logging.basicConfig(
     format="%(asctime)s %(levelname)s %(name)s: %(message)s",
     level=logging.INFO,
 )
 log = logging.getLogger("ytdl-bot")
-logging.getLogger("httpx").setLevel(logging.WARNING)
-logging.getLogger("httpcore").setLevel(logging.WARNING)
-# HTTP client INFO logs may include the Telegram token in request URLs.
-logging.getLogger("httpx").setLevel(logging.WARNING)
-logging.getLogger("httpcore").setLevel(logging.WARNING)
-
-JOB_TIMEOUT = max(10, int(os.getenv("JOB_TIMEOUT", "240")))
-QUEUE_LIMIT = max(1, int(os.getenv("QUEUE_LIMIT", "10")))
 
 # ========== Cookies ==========
 LOCAL_COOKIES  = Path(__file__).parent / "cookies.txt"
@@ -119,7 +95,7 @@ def load_refs():
 
 def save_refs():
     try:
-        atomic_write_json(REF_FILE, _refs)
+        REF_FILE.write_text(json.dumps(_refs, ensure_ascii=False), encoding="utf-8")
     except Exception:
         log.warning("refs save failed", exc_info=True)
 
@@ -149,7 +125,7 @@ def load_bookmarks():
 
 def save_bookmarks():
     try:
-        atomic_write_json(BK_FILE, _bookmarks)
+        BK_FILE.write_text(json.dumps(_bookmarks, ensure_ascii=False), encoding="utf-8")
     except Exception:
         log.warning("bookmarks save failed", exc_info=True)
 
@@ -463,19 +439,14 @@ def make_qr_sync(text):
 
 def tts_sync(text):
     mp3 = Path(tempfile.gettempdir()) / f"tts_{uuid.uuid4().hex}.mp3"
+    gTTS(text=text, lang="ru").save(str(mp3))
     ogg = mp3.with_suffix(".ogg")
-    try:
-        gTTS(text=text, lang="ru").save(str(mp3))
-        subprocess.run(
-            ["ffmpeg", "-y", "-loglevel", "error", "-i", str(mp3),
-             "-c:a", "libopus", "-b:a", "64k", str(ogg)],
-            capture_output=True, timeout=180, check=True)
-        return ogg
-    except BaseException:
-        ogg.unlink(missing_ok=True)
-        raise
-    finally:
-        mp3.unlink(missing_ok=True)
+    subprocess.run(
+        ["ffmpeg", "-y", "-loglevel", "error", "-i", str(mp3),
+         "-c:a", "libopus", "-b:a", "64k", str(ogg)],
+        capture_output=True, timeout=180, check=True)
+    mp3.unlink(missing_ok=True)
+    return ogg
 
 
 def convert_sync(src, target):
@@ -521,10 +492,10 @@ def base_opts(url):
         "noplaylist": True,
         "quiet": True,
         "no_warnings": True,
-        "retries": 1,
-        "socket_timeout": 15,
-        "extractor_retries": 1,
-        "file_access_retries": 1,
+        "retries": 5,
+        "socket_timeout": 60,
+        "extractor_retries": 5,
+        "file_access_retries": 5,
         "remote_components": ["ejs:github"],
         "extractor_args": {
             "youtube": {
@@ -585,53 +556,44 @@ def download_sync(url, kind, hook=None):
     p = platform_from_url(url)
     job = DOWNLOAD_DIR / uuid.uuid4().hex
     job.mkdir(parents=True, exist_ok=True)
-    try:
-        tpl = str(job / "%(title).90B [%(id)s].%(ext)s")
-        with yt_dlp.YoutubeDL(ydl_options(url, kind, tpl, hook)) as y:
-            info = y.extract_info(url, download=True)
-            expected = Path(y.prepare_filename(info))
-        if kind == "audio":
-            mp3 = list(job.glob("*.mp3"))
-            if mp3:
-                return mp3[0]
-        res = expected if expected.exists() else None
-        if res is None:
-            c = [x for x in job.iterdir() if x.is_file()
-                 and x.suffix.lower() in {".mp4", ".mkv", ".webm", ".mov", ".mp3", ".m4a", ".ogg", ".opus"}]
-            if c:
-                res = max(c, key=lambda x: x.stat().st_size)
-        if res is None:
-            raise FileNotFoundError("файл не найден")
-        if p in ("instagram", "facebook", "vk", "tiktok", "twitter", "rutube"):
-            res = fix_aspect(res)
-        return res
-    except BaseException:
-        shutil.rmtree(job, ignore_errors=True)
-        raise
+    tpl = str(job / "%(title).90B [%(id)s].%(ext)s")
+    with yt_dlp.YoutubeDL(ydl_options(url, kind, tpl, hook)) as y:
+        info = y.extract_info(url, download=True)
+        expected = Path(y.prepare_filename(info))
+    if kind == "audio":
+        mp3 = list(job.glob("*.mp3"))
+        if mp3:
+            return mp3[0]
+    res = expected if expected.exists() else None
+    if res is None:
+        c = [x for x in job.iterdir() if x.is_file() and not x.name.endswith((".part", ".ytdl"))]
+        if c:
+            res = max(c, key=lambda x: x.stat().st_size)
+    if res is None:
+        raise FileNotFoundError("файл не найден")
+    if p in ("instagram", "facebook", "vk", "tiktok", "twitter", "rutube"):
+        res = fix_aspect(res)
+    return res
 
 
 def download_subs_sync(url):
     job = DOWNLOAD_DIR / ("subs_" + uuid.uuid4().hex)
     job.mkdir(parents=True, exist_ok=True)
-    try:
-        o = base_opts(url)
-        o.update({
-            "skip_download": True,
-            "writesubtitles": True,
-            "writeautomaticsub": True,
-            "subtitleslangs": ["ru", "en"],
-            "subtitlesformat": "srt",
-            "outtmpl": str(job / "%(title).90B [%(id)s].%(ext)s"),
-        })
-        with yt_dlp.YoutubeDL(o) as y:
-            y.extract_info(url, download=True)
-        files = list(job.glob("*.srt")) + list(job.glob("*.vtt"))
-        if not files:
-            raise FileNotFoundError("нет субтитров")
-        return max(files, key=lambda x: x.stat().st_size)
-    except BaseException:
-        shutil.rmtree(job, ignore_errors=True)
-        raise
+    o = base_opts(url)
+    o.update({
+        "skip_download": True,
+        "writesubtitles": True,
+        "writeautomaticsub": True,
+        "subtitleslangs": ["ru", "en"],
+        "subtitlesformat": "srt",
+        "outtmpl": str(job / "%(title).90B [%(id)s].%(ext)s"),
+    })
+    with yt_dlp.YoutubeDL(o) as y:
+        y.extract_info(url, download=True)
+    files = list(job.glob("*.srt")) + list(job.glob("*.vtt"))
+    if not files:
+        raise FileNotFoundError("нет субтитров")
+    return max(files, key=lambda x: x.stat().st_size)
 
 
 def cleanup_file(path):
@@ -710,12 +672,7 @@ async def acquire_slot():
     global active_jobs, waiting_jobs
     async with stats_lock:
         waiting_jobs += 1
-    try:
-        await semaphore.acquire()
-    except BaseException:
-        async with stats_lock:
-            waiting_jobs -= 1
-        raise
+    await semaphore.acquire()
     async with stats_lock:
         waiting_jobs -= 1
         active_jobs += 1
@@ -813,9 +770,8 @@ async def cmd_status(update, ctx):
 
 
 async def cmd_cancel(update, ctx):
-    await cancel_user_job(update.effective_user.id)
-    reset_user_data(ctx.user_data)
-    await update.message.reply_text("Задание отменено. Все состояния сброшены.", reply_markup=REPLY_MENU)
+    ctx.user_data.clear()
+    await update.message.reply_text("Все состояния сброшены.", reply_markup=REPLY_MENU)
 
 
 async def cmd_ref(update, ctx):
@@ -881,15 +837,49 @@ async def cmd_admin(update, ctx):
 
 # ========== Превью + меню ==========
 async def show_video_menu(update, ctx, platform, url):
-    # No YouTube requests before the quality menu.
-    ctx.user_data["title"] = None
-    msg = await update.effective_message.reply_text(
-        f"{PLATFORM_NAMES.get(platform, platform)}: видео\n\nВыберите качество:",
-        reply_markup=QUALITY_MENU)
-    menus = ctx.user_data.setdefault("video_menus", {})
-    menus[str(msg.message_id)] = (url, platform)
-    while len(menus) > 20:
-        menus.pop(next(iter(menus)))
+    msg = await update.effective_message.reply_text("🔍 Получаю информацию…")
+    loop = asyncio.get_running_loop()
+    info = None
+    try:
+        info = await asyncio.wait_for(
+            loop.run_in_executor(None, extract_info_sync, url), timeout=60)
+    except asyncio.TimeoutError:
+        log.warning("info timeout")
+    except Exception:
+        log.warning("info failed", exc_info=True)
+
+    if info:
+        title = truncate(info.get("title") or "Видео", 60)
+        lines = [f"{PLATFORM_NAMES[platform]}: {title}"]
+        up = truncate(info.get("uploader") or info.get("channel") or "", 40)
+        dur = fmt_dur(info.get("duration"))
+        if up:
+            lines.append(f"👤 {up}")
+        if dur:
+            lines.append(f"⏱ {dur}")
+    else:
+        title = None
+        lines = [f"{PLATFORM_NAMES[platform]}: видео"]
+
+    lines += ["", "Выберите качество:"]
+    caption = "\n".join(lines)
+    ctx.user_data["title"] = title
+
+    await msg.delete()
+    thumb = info.get("thumbnail") if info else None
+    if thumb:
+        data = await loop.run_in_executor(None, fetch_thumb_bytes, thumb, platform)
+        if data:
+            try:
+                await update.effective_message.reply_photo(
+                    photo=data, caption=caption, reply_markup=QUALITY_MENU)
+                return
+            except Exception:
+                log.warning("photo failed")
+    await update.effective_message.reply_text(caption, reply_markup=QUALITY_MENU)
+
+
+# ========== Обработка текста ==========
 async def handle_text(update, ctx):
     if not await require_subscription(update, ctx):
         return
@@ -897,8 +887,7 @@ async def handle_text(update, ctx):
     state = ctx.user_data.get("await")
 
     if text == "❌ Отмена":
-        await cancel_user_job(update.effective_user.id)
-        reset_user_data(ctx.user_data)
+        ctx.user_data.clear()
         await update.message.reply_text("Отменено.", reply_markup=REPLY_MENU)
         return
     if text == "🎬 Скачать видео":
@@ -935,7 +924,7 @@ async def handle_text(update, ctx):
 
     platform, url = detect_platform(text)
     if platform:
-        reset_user_data(ctx.user_data)
+        ctx.user_data.clear()
         ctx.user_data["url"] = url
         ctx.user_data["platform"] = platform
         await show_video_menu(update, ctx, platform, url)
@@ -1038,9 +1027,7 @@ async def on_document(update, ctx):
     msg = await update.message.reply_text("📥 Скачиваю файл…")
     job = DOWNLOAD_DIR / ("doc_" + uuid.uuid4().hex)
     job.mkdir(parents=True, exist_ok=True)
-    # Never use a user-supplied path as a filesystem path.
-    filename = Path((doc.file_name or "upload.bin").replace("\\", "/")).name
-    src = job / ("input_" + (filename or "upload.bin"))
+    src = job / (doc.file_name or f"file_{uuid.uuid4().hex}")
     try:
         f = await doc.get_file()
         await f.download_to_drive(str(src))
@@ -1051,7 +1038,6 @@ async def on_document(update, ctx):
         return
 
     if state == "conv_file":
-        cleanup_pending_conversion(ctx.user_data)
         ctx.user_data["conv_src"] = str(src)
         ctx.user_data.pop("await", None)
         await msg.edit_text("🔄 В какой формат конвертировать?", reply_markup=CONV_MENU)
@@ -1118,7 +1104,7 @@ async def do_search(update, ctx, query):
 
 
 # ========== Скачивание ==========
-async def _download_and_send(update, ctx, url, requested_kind, via_callback=False, trim=None):
+async def download_and_send(update, ctx, url, requested_kind, via_callback=False, trim=None):
     query = update.callback_query if via_callback else None
     message = query.message if query else update.effective_message
     chat_id = message.chat_id
@@ -1166,14 +1152,13 @@ async def _download_and_send(update, ctx, url, requested_kind, via_callback=Fals
             path = None
 
             try:
-                path = await run_media_worker("download", url, kind, hook)
+                path = await loop.run_in_executor(None, download_sync, url, kind, hook)
 
                 if trim:
                     try:
                         trimmed = await loop.run_in_executor(
                             None, trim_sync, path, trim[0], trim[1])
-                        # Source and trimmed output are in the same directory.
-                        path.unlink(missing_ok=True)
+                        cleanup_file(path)
                         path = trimmed
                     except Exception:
                         log.warning("trim failed", exc_info=True)
@@ -1227,7 +1212,7 @@ async def _download_and_send(update, ctx, url, requested_kind, via_callback=Fals
                     await ctx.bot.delete_message(pmsg.chat_id, pmsg.message_id)
                 except Exception:
                     pass
-                if "requested format is not available" not in err.lower() or idx == len(attempts) - 1:
+                if idx == len(attempts) - 1:
                     raise
             finally:
                 cleanup_file(path)
@@ -1247,7 +1232,7 @@ async def _download_and_send(update, ctx, url, requested_kind, via_callback=Fals
 
 
 # ========== Субтитры ==========
-async def _send_subs(update, ctx, url):
+async def send_subs(update, ctx, url):
     q = update.callback_query
     try:
         await q.edit_message_text("📝 Ищу субтитры…")
@@ -1256,7 +1241,8 @@ async def _send_subs(update, ctx, url):
     loop = asyncio.get_running_loop()
     path = None
     try:
-        path = await run_media_worker("subs", url)
+        path = await asyncio.wait_for(
+            loop.run_in_executor(None, download_subs_sync, url), timeout=90)
         with path.open("rb") as f:
             await ctx.bot.send_document(chat_id=q.message.chat_id, document=f,
                                         filename=path.name, caption="📝 Субтитры")
@@ -1310,7 +1296,7 @@ async def on_callback(update, ctx):
                 pass
             return
         b = items[int(val)]
-        reset_user_data(ctx.user_data)
+        ctx.user_data.clear()
         ctx.user_data["url"] = b["url"]
         ctx.user_data["platform"] = b.get("platform", "other")
         try:
@@ -1318,7 +1304,10 @@ async def on_callback(update, ctx):
         except Exception:
             pass
         chat_id = q.message.chat_id
-        await show_video_menu(update, ctx, b.get("platform", "other"), b["url"])
+        await ctx.bot.send_message(
+            chat_id,
+            f"⭐ Повтор закладки:\n{b.get('title') or b['url']}\n\nВыберите качество:",
+            reply_markup=QUALITY_MENU)
         return
 
     if data.startswith("tool:"):
@@ -1348,13 +1337,11 @@ async def on_callback(update, ctx):
     if data.startswith("conv:"):
         target = data[5:]
         if target == "cancel":
-            cleanup_pending_conversion(ctx.user_data)
+            ctx.user_data.pop("conv_src", None)
             try:
                 await q.edit_message_text("❌ Отменено.")
             except Exception:
                 pass
-            return
-        if target not in {"mp3", "wav", "mp4", "m4a"}:
             return
         src_path = ctx.user_data.pop("conv_src", None)
         if not src_path or not Path(src_path).exists():
@@ -1370,7 +1357,9 @@ async def on_callback(update, ctx):
         loop = asyncio.get_running_loop()
         out = None
         try:
-            out = await loop.run_in_executor(None, convert_sync, Path(src_path), target)
+            out = await asyncio.wait_for(
+                loop.run_in_executor(None, convert_sync, Path(src_path), target),
+                timeout=900)
             size_mb = out.stat().st_size / (1024 * 1024)
             if size_mb > MAX_SIZE_MB:
                 await ctx.bot.send_message(
@@ -1417,17 +1406,9 @@ async def on_callback(update, ctx):
         return
 
     action = data.removeprefix("q:")
-    if data.startswith("q:") and action != "cancel":
-        bound = ctx.user_data.get("video_menus", {}).get(str(q.message.message_id))
-        if not bound:
-            await q.message.reply_text("Это меню устарело. Отправьте ссылку заново.")
-            return
-        ctx.user_data["url"], ctx.user_data["platform"] = bound
-
 
     if action == "cancel":
-        await cancel_user_job(update.effective_user.id)
-        reset_user_data(ctx.user_data)
+        ctx.user_data.clear()
         try:
             await q.edit_message_reply_markup(reply_markup=None)
         except Exception:
@@ -1504,7 +1485,7 @@ def start_health_server():
         def _ok(self, body):
             self.send_response(200)
             self.send_header("Content-Type", "text/plain; charset=utf-8")
-            self.send_header("Content-Length", str(len(b"OK - bot is running")))
+            self.send_header("Content-Length", "19")
             self.end_headers()
             if body:
                 self.wfile.write(b"OK - bot is running")
@@ -1528,7 +1509,7 @@ async def digest_loop(app):
             now = datetime.now(timezone.utc)
             target = now.replace(hour=DIGEST_HOUR, minute=0, second=0, microsecond=0)
             if target <= now:
-                target += timedelta(days=1)
+                target = target.replace(day=target.day + 1)
             wait = (target - now).total_seconds()
             await asyncio.sleep(wait)
             if not ADMIN_ID:
@@ -1564,38 +1545,7 @@ async def post_init(app: Application):
         BotCommand("status", "📊 Статус"),
         BotCommand("cancel", "❌ Отмена"),
     ])
-    app.bot_data["digest_task"] = asyncio.create_task(digest_loop(app), name="digest")
-
-
-async def post_stop(app: Application):
-    await stop_all_jobs()
-    task = app.bot_data.pop("digest_task", None)
-    if task is not None:
-        task.cancel()
-        with suppress(asyncio.CancelledError):
-            await task
-    for user_data in app.user_data.values():
-        cleanup_pending_conversion(user_data)
-    save_refs()
-    save_bookmarks()
-
-
-async def on_error(update, ctx):
-    # Do not print exception text: upstream URLs may contain credentials.
-    log.error("Unhandled handler error: %s", type(ctx.error).__name__)
-
-
-def cleanup_pending_conversion(user_data):
-    src = user_data.pop("conv_src", None)
-    if src:
-        parent = Path(src).parent
-        if parent.parent.resolve() == DOWNLOAD_DIR.resolve() and parent.name.startswith("doc_"):
-            shutil.rmtree(parent, ignore_errors=True)
-
-
-def reset_user_data(user_data):
-    cleanup_pending_conversion(user_data)
-    user_data.clear()
+    asyncio.create_task(digest_loop(app))
 
 
 def main():
@@ -1609,13 +1559,10 @@ def main():
     app = (Application.builder()
            .token(TOKEN)
            .post_init(post_init)
-           .post_stop(post_stop)
-           .connect_timeout(30).read_timeout(120).write_timeout(120).pool_timeout(30)
-           .media_write_timeout(120)
+           .connect_timeout(30).read_timeout(30).write_timeout(30).pool_timeout(30)
            .get_updates_connect_timeout(30).get_updates_read_timeout(30)
            .build())
 
-    app.add_error_handler(on_error)
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("help", cmd_help))
     app.add_handler(CommandHandler("status", cmd_status))
@@ -1632,134 +1579,5 @@ def main():
     app.run_polling(allowed_updates=Update.ALL_TYPES)
 
 
-
-# Background jobs are deliberately separate from the sequential update handler.
-# Each job receives a snapshot; later links cannot change its URL/title.
-_user_jobs = {}
-
-async def cancel_user_job(uid):
-    task = _user_jobs.get(uid)
-    if task and not task.done():
-        task.cancel()
-        await asyncio.gather(task, return_exceptions=True)
-
-async def stop_all_jobs():
-    tasks = list(_user_jobs.values())
-    for task in tasks:
-        task.cancel()
-    await asyncio.gather(*tasks, return_exceptions=True)
-    _user_jobs.clear()
-
-async def launch_job(update, ctx, operation, *args, **kwargs):
-    uid = update.effective_user.id
-    if uid in _user_jobs:
-        await update.effective_message.reply_text(
-            "У вас уже есть задание. Дождитесь окончания или отправьте /cancel.")
-        return
-    if len(_user_jobs) >= QUEUE_LIMIT + MAX_CONCURRENT:
-        await update.effective_message.reply_text("Очередь заполнена. Попробуйте позже.")
-        return
-    snapshot = SimpleNamespace(bot=ctx.bot, user_data=dict(ctx.user_data), application=ctx.application)
-    await update.effective_message.reply_text(
-        f"Задание принято. Лимит ожидания и обработки: {JOB_TIMEOUT} сек. Отмена: /cancel")
-    async def run():
-        try:
-            await asyncio.wait_for(operation(update, snapshot, *args, **kwargs), JOB_TIMEOUT)
-        except asyncio.TimeoutError:
-            await update.effective_message.reply_text(
-                "Превышено время задания. Загрузка остановлена. Попробуйте короткое видео или меньшее качество.")
-        except asyncio.CancelledError:
-            raise
-        except Exception as exc:
-            log.warning("Background job failed: %s", type(exc).__name__)
-            await update.effective_message.reply_text("Не удалось выполнить задание. Попробуйте позже.")
-        finally:
-            _user_jobs.pop(uid, None)
-    _user_jobs[uid] = asyncio.create_task(run())
-
-async def download_and_send(update, ctx, *args, **kwargs):
-    await launch_job(update, ctx, _download_and_send, *args, **kwargs)
-
-async def send_subs(update, ctx, url):
-    # Subtitles also share the global concurrency limit.
-    async def operation(u, c):
-        await acquire_slot()
-        try:
-            await _send_subs(u, c, url)
-        finally:
-            await release_slot(False)
-    await launch_job(update, ctx, operation)
-
-async def run_media_worker(mode, url, kind="best", hook=None):
-    # Unlike wait_for(executor), killing this subprocess really stops yt-dlp
-    # and its ffmpeg children before temporary files are removed (Linux/Render).
-    job = Path(tempfile.mkdtemp(prefix="worker_", dir=DOWNLOAD_DIR))
-    proc = None
-    try:
-        proc = await asyncio.create_subprocess_exec(
-            sys.executable, str(Path(__file__).resolve()), "--media-worker", str(job),
-            stdin=asyncio.subprocess.PIPE, stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.DEVNULL, start_new_session=True)
-        proc.stdin.write(json.dumps({"mode": mode, "url": url, "kind": kind}).encode())
-        await proc.stdin.drain()
-        proc.stdin.close()
-        result = None
-        while True:
-            line = await proc.stdout.readline()
-            if not line:
-                break
-            try:
-                event = json.loads(line)
-            except (ValueError, UnicodeError):
-                continue
-            if event.get("event") == "progress" and hook:
-                hook(event["data"])
-            elif event.get("event") == "result":
-                result = event
-        await proc.wait()
-        if not result or not result.get("ok"):
-            raise yt_dlp.utils.DownloadError((result or {}).get("error", "Загрузчик завершился без результата"))
-        path = Path(result["path"])
-        if job.resolve() not in path.resolve().parents or not path.is_file():
-            raise RuntimeError("Invalid worker output")
-        # Move the complete media directory out of the process workspace.
-        target = DOWNLOAD_DIR / uuid.uuid4().hex
-        shutil.move(str(path.parent), str(target))
-        return target / path.name
-    finally:
-        if proc:
-            # Kill the entire session even if the direct child already exited.
-            try:
-                os.killpg(proc.pid, signal.SIGKILL)
-            except ProcessLookupError:
-                pass
-            await proc.wait()
-        shutil.rmtree(job, ignore_errors=True)
-
-def media_worker():
-    global DOWNLOAD_DIR
-    DOWNLOAD_DIR = Path(sys.argv[2])
-    payload = json.load(sys.stdin)
-    last = [0.0]
-    def emit(event):
-        print(json.dumps(event, ensure_ascii=False), flush=True)
-    def progress(data):
-        now = time.monotonic()
-        if now - last[0] < PROGRESS_EVERY:
-            return
-        last[0] = now
-        fields = ("status", "downloaded_bytes", "total_bytes", "total_bytes_estimate", "speed", "eta")
-        emit({"event": "progress", "data": {k: data.get(k) for k in fields}})
-    try:
-        path = (download_subs_sync(payload["url"]) if payload["mode"] == "subs"
-                else download_sync(payload["url"], payload["kind"], progress))
-        emit({"event": "result", "ok": True, "path": str(path)})
-    except Exception as exc:
-        emit({"event": "result", "ok": False, "error": clean_err(exc)[:1500]})
-
-
 if __name__ == "__main__":
-    if len(sys.argv) > 1 and sys.argv[1] == "--media-worker":
-        media_worker()
-    else:
-        main()
+    main()
