@@ -1,5 +1,5 @@
 python-telegram-bot>=21.0
-yt-dlp
+yt-dlp>=2025.1.1
 curl_cffi
 qrcode[pil]
 Pillow
