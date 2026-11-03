@@ -1,10 +1,13 @@
 # bot.py — YouTube / Insta / FB / VK / TikTok / Twitter / Rutube / SoundCloud
 # + закладки + share + админ-панель + авто-дайджест + поиск + inline
 # + обрезка + субтитры + рефералка + QR + TTS + конвертер + водяной знак
+# + динамическое меню форматов + превью + перебор прокси + webhook/polling
 import os
 import re
+import io
 import time
 import json
+import html
 import uuid
 import asyncio
 import logging
@@ -12,11 +15,12 @@ import tempfile
 import shutil
 import subprocess
 import urllib.request
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from urllib.parse import urlsplit, quote
 from threading import Thread
 from http.server import BaseHTTPRequestHandler, HTTPServer
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 
 import yt_dlp
 import qrcode
@@ -36,7 +40,6 @@ from telegram.ext import (
 TOKEN          = os.getenv("BOT_TOKEN")
 MAX_SIZE_MB    = int(os.getenv("MAX_SIZE_MB", "48"))
 MAX_CONCURRENT = int(os.getenv("MAX_CONCURRENT", "2"))
-PROXY_URL      = os.getenv("PROXY_URL", "").strip()
 PROGRESS_EVERY = float(os.getenv("PROGRESS_EVERY", "3"))
 FIX_ASPECT     = os.getenv("FIX_ASPECT", "0") == "1"
 REF_GOAL       = int(os.getenv("REF_GOAL", "3"))
@@ -44,7 +47,25 @@ WATERMARK      = os.getenv("WATERMARK", "@edrikevideo")
 FONT_PATH      = os.getenv("FONT_PATH", "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf")
 MAX_UPLOAD_MB  = 20
 BOOKMARKS_MAX  = 10
-DIGEST_HOUR    = int(os.getenv("DIGEST_HOUR", "20"))  # UTC, 20:00 UTC = 23:00 МСК
+DIGEST_HOUR    = int(os.getenv("DIGEST_HOUR", "20"))
+
+IO_WORKERS       = int(os.getenv("IO_WORKERS", "8"))
+YTDL_WORKERS     = int(os.getenv("YTDL_WORKERS", "4"))
+SUB_CACHE_TTL    = int(os.getenv("SUB_CACHE_TTL", "300"))
+DOWNLOAD_TIMEOUT = int(os.getenv("DOWNLOAD_TIMEOUT", "1800"))
+DROP_PENDING     = os.getenv("DROP_PENDING", "0") == "1"
+
+# прокси
+PROXY_URL             = os.getenv("PROXY_URL", "").strip()
+PROXY_LIST            = [p.strip() for p in os.getenv("PROXY_LIST", "").split(",") if p.strip()]
+PROXY_FALLBACK_DIRECT = os.getenv("PROXY_FALLBACK_DIRECT", "1") == "1"
+PROXY_PENALTY_MAX     = int(os.getenv("PROXY_PENALTY_MAX", "600"))
+if not PROXY_URL and PROXY_LIST:
+    PROXY_URL = PROXY_LIST[0]
+
+# запуск: polling | webhook
+RUN_MODE = os.getenv("RUN_MODE", "polling").lower()
+WEBHOOK_PATH = os.getenv("WEBHOOK_PATH", "/telegram")
 
 CHANNEL      = "@edrikevideo"
 CHANNEL_URL  = "https://t.me/edrikevideo"
@@ -62,6 +83,72 @@ logging.basicConfig(
 )
 log = logging.getLogger("ytdl-bot")
 
+# ========== Пул потоков и семафоры ==========
+IO_POOL  = ThreadPoolExecutor(max_workers=IO_WORKERS, thread_name_prefix="io")
+YTDL_SEM = asyncio.Semaphore(YTDL_WORKERS)
+
+
+async def run_io(fn, *args):
+    loop = asyncio.get_running_loop()
+    return await loop.run_in_executor(IO_POOL, fn, *args)
+
+
+async def run_ytdlp(fn, *args):
+    async with YTDL_SEM:
+        return await run_io(fn, *args)
+
+
+# ========== Управление прокси ==========
+_proxy_state = {}   # proxy -> (до_какого_времени_отложен, счётчик_ошибок)
+
+
+def _proxy_ok(p):
+    until, _ = _proxy_state.get(p, (0, 0))
+    return time.time() >= until
+
+
+def _proxy_fail(p):
+    _, n = _proxy_state.get(p, (0, 0))
+    n += 1
+    penalty = min(PROXY_PENALTY_MAX, 15 * n)
+    _proxy_state[p] = (time.time() + penalty, n)
+    log.warning("прокси %s отложен на %s сек (ошибка №%s)", _mask(p), penalty, n)
+
+
+def _proxy_success(p):
+    if p:
+        _proxy_state.pop(p, None)
+
+
+def _mask(p):
+    if not p:
+        return ""
+    return re.sub(r"://[^@/]+@", "://***:***@", p)
+
+
+def is_proxy_error(e):
+    s = str(e).lower()
+    return ("unable to connect to proxy" in s
+            or "proxyerror" in s
+            or "proxy error" in s
+            or "unexpected_eof_while_reading" in s
+            or "wrong version number" in s
+            or ("timed out" in s and "proxy" in s))
+
+
+def proxy_candidates(platform):
+    if platform != "youtube":
+        return [None]
+    pool = []
+    for p in ([PROXY_URL] if PROXY_URL else []) + PROXY_LIST:
+        if p and p not in pool:
+            pool.append(p)
+    out = [p for p in pool if _proxy_ok(p)]
+    if PROXY_FALLBACK_DIRECT:
+        out.append(None)
+    return out or [None]
+
+
 # ========== Cookies ==========
 LOCAL_COOKIES  = Path(__file__).parent / "cookies.txt"
 SECRET_COOKIES = Path("/etc/secrets/cookies.txt")
@@ -77,7 +164,8 @@ if SECRET_COOKIES.exists():
 elif LOCAL_COOKIES.exists():
     COOKIES_FILE = LOCAL_COOKIES
 
-log.info("Cookies: %s | Прокси: %s", bool(COOKIES_FILE and COOKIES_FILE.exists()), bool(PROXY_URL))
+log.info("Cookies: %s | Прокси: %s | Режим: %s",
+         bool(COOKIES_FILE and COOKIES_FILE.exists()), _mask(PROXY_URL), RUN_MODE)
 
 # ========== Рефералка ==========
 _refs = {}
@@ -141,11 +229,38 @@ async def add_bookmark(uid, url, title, platform):
             "ts": int(time.time()),
         })
         _bookmarks[str(uid)] = lst[:BOOKMARKS_MAX]
-        save_bookmarks()
+        await asyncio.to_thread(save_bookmarks)
 
 
 def get_bookmarks(uid):
     return _bookmarks.get(str(uid), [])
+
+
+# ========== Кэш подписки ==========
+_sub_cache = {}
+
+
+def _sub_cache_prune():
+    if len(_sub_cache) > 5000:
+        for k, _ in sorted(_sub_cache.items(), key=lambda x: x[1][0])[:1000]:
+            _sub_cache.pop(k, None)
+
+
+async def check_subscription(bot, user_id, force=False):
+    now = time.time()
+    if not force:
+        c = _sub_cache.get(user_id)
+        if c and now - c[0] < SUB_CACHE_TTL:
+            return c[1]
+    try:
+        m = await bot.get_chat_member(CHANNEL, user_id)
+        ok = m.status not in ("left", "kicked")
+    except Exception:
+        log.exception("sub check failed")
+        ok = False
+    _sub_cache[user_id] = (now, ok)
+    _sub_cache_prune()
+    return ok
 
 
 # ========== Статистика ==========
@@ -243,15 +358,6 @@ def fetch_thumb_bytes(url, platform):
 
 
 # ========== Подписка ==========
-async def check_subscription(bot, user_id):
-    try:
-        m = await bot.get_chat_member(CHANNEL, user_id)
-        return m.status not in ("left", "kicked")
-    except Exception:
-        log.exception("sub check failed")
-        return False
-
-
 def sub_keyboard():
     return InlineKeyboardMarkup([
         [InlineKeyboardButton("📢 Подписаться на канал", url=CHANNEL_URL)],
@@ -294,19 +400,6 @@ CONV_MENU = InlineKeyboardMarkup([
     [InlineKeyboardButton("❌ Отмена", callback_data="conv:cancel")],
 ])
 
-QUALITY_MENU = InlineKeyboardMarkup([
-    [InlineKeyboardButton("🎬 1080p", callback_data="q:1080"),
-     InlineKeyboardButton("🎬 720p",  callback_data="q:720")],
-    [InlineKeyboardButton("🎬 480p",  callback_data="q:480"),
-     InlineKeyboardButton("🎬 360p",  callback_data="q:360")],
-    [InlineKeyboardButton("⭐ Лучшее", callback_data="q:best"),
-     InlineKeyboardButton("🎵 MP3",    callback_data="q:audio")],
-    [InlineKeyboardButton("✂️ Обрезать", callback_data="q:trim"),
-     InlineKeyboardButton("📝 Субтитры", callback_data="q:subs")],
-    [InlineKeyboardButton("⭐ В закладки", callback_data="q:bk"),
-     InlineKeyboardButton("❌ Отмена",     callback_data="q:cancel")],
-])
-
 LABELS = {"1080": "1080p", "720": "720p", "480": "480p", "360": "360p",
           "best": "лучшее качество", "audio": "MP3"}
 
@@ -338,6 +431,145 @@ YT_FALLBACKS = {
 }
 
 SOCIAL_ORDER = ["1080", "720", "480", "360", "best", "audio"]
+
+# ========== Динамические форматы ==========
+STD_HEIGHTS = [144, 240, 360, 480, 720, 1080, 1440, 2160]
+MAX_FORMAT_BUTTONS = 6
+
+
+def _size_str(b):
+    if not b:
+        return "?"
+    mb = b / (1024 * 1024)
+    if mb >= 1024:
+        return f"{mb / 1024:.1f}GB"
+    return f"{mb:.0f}MB"
+
+
+def collect_formats(info):
+    dur = info.get("duration") or 0
+    out = {}
+    for f in info.get("formats") or []:
+        h = f.get("height")
+        vcodec = f.get("vcodec")
+        if not h or not vcodec or vcodec == "none" or h < 144:
+            continue
+        size = f.get("filesize") or f.get("filesize_approx")
+        if size is None:
+            tbr = f.get("tbr") or 0
+            if tbr and dur:
+                size = int(tbr * 1000 / 8 * dur)
+        has_audio = bool(f.get("acodec")) and f.get("acodec") != "none"
+        cur = out.get(h)
+        if cur is None:
+            out[h] = {"size": int(size or 0), "has_audio": has_audio}
+        else:
+            if size and size > cur["size"]:
+                cur["size"] = int(size)
+            cur["has_audio"] = cur["has_audio"] or has_audio
+
+    if not out:
+        return {}
+    heights = sorted(out)
+    if len(heights) > MAX_FORMAT_BUTTONS:
+        keep = [h for h in STD_HEIGHTS if h in out]
+        for h in reversed(heights):
+            if len(keep) >= MAX_FORMAT_BUTTONS:
+                break
+            if h not in keep:
+                keep.append(h)
+        keep = sorted(keep)[:MAX_FORMAT_BUTTONS]
+        out = {h: out[h] for h in keep}
+    return out
+
+
+def format_selector(kind, platform):
+    if kind == "audio":
+        return "bestaudio/best"
+    if kind.isdigit():
+        h = int(kind)
+        if platform == "youtube":
+            return f"bv*[height<={h}]+ba/b[height<={h}]"
+        return f"best[height<={h}]/best"
+    if platform == "youtube":
+        return YT_FORMATS.get(kind, YT_FORMATS["best"])
+    return SOCIAL_FORMATS.get(kind, SOCIAL_FORMATS["best"])
+
+
+def fallback_chain(kind, platform, heights):
+    if kind == "audio":
+        return ["audio"]
+    if kind.isdigit():
+        h = int(kind)
+        lower = sorted((x for x in (heights or []) if x < h), reverse=True)
+        return [str(h)] + [str(x) for x in lower] + ["audio"]
+    if platform == "youtube":
+        return [kind] + YT_FALLBACKS.get(kind, [])
+    if kind in SOCIAL_ORDER:
+        return SOCIAL_ORDER[SOCIAL_ORDER.index(kind):]
+    return list(SOCIAL_ORDER)
+
+
+def label_for(kind):
+    if kind.isdigit():
+        return f"{kind}p"
+    return LABELS.get(kind, kind)
+
+
+# ========== Карточка и клавиатура ==========
+def build_preview_text(info):
+    title = html.escape(truncate(info.get("title") or "Видео", 70))
+    uploader = (info.get("uploader") or info.get("channel") or "").strip()
+    up_url = (info.get("uploader_url") or info.get("channel_url") or "").strip()
+
+    lines = [f"📼 <b>{title}</b> ➔"]
+    if uploader:
+        up = html.escape(truncate(uploader, 40))
+        if up_url:
+            lines.append(f'👤 <a href="{up_url}">{up}</a> ➔')
+        else:
+            lines.append(f"👤 {up} ➔")
+
+    fmts = collect_formats(info)
+    if fmts:
+        lines.append("")
+        for h, d in fmts.items():
+            mark = "✅" if d["has_audio"] else "⚡"
+            lines.append(f"{mark} {h}p: {_size_str(d['size'])}")
+
+    lines.append("")
+    lines.append("Форматы для скачивания ↓")
+    return "\n".join(lines), fmts
+
+
+def build_quality_kb(fmts, selected, ch_url="", ch_name="канал"):
+    rows, chunk = [], []
+    for h, d in fmts.items():
+        mark = "✅" if d.get("has_audio") else "⚡"
+        box = "☑" if h in selected else "☐"
+        chunk.append(InlineKeyboardButton(f"{mark} {h}p {box}", callback_data=f"fmt:t:{h}"))
+        if len(chunk) == 3:
+            rows.append(chunk)
+            chunk = []
+    if chunk:
+        rows.append(chunk)
+
+    rows.append([InlineKeyboardButton("📼 МР3", callback_data="fmt:audio"),
+                 InlineKeyboardButton("🖼 Превью", callback_data="fmt:prev")])
+    rows.append([InlineKeyboardButton("✂️ Обрезка", callback_data="fmt:trim")])
+
+    if selected:
+        rows.append([InlineKeyboardButton("⬇️ Скачать выбранное", callback_data="fmt:dl")])
+    else:
+        best = max(fmts) if fmts else None
+        rows.append([InlineKeyboardButton(
+            f"⬇️ Скачать {best}p" if best else "⬇️ Скачать лучшее",
+            callback_data="fmt:best")])
+
+    rows.append([InlineKeyboardButton(
+        f"Перейти в 👤 {truncate(ch_name or 'канал', 30)} ➔",
+        url=ch_url or CHANNEL_URL)])
+    return InlineKeyboardMarkup(rows)
 
 
 # ========== Прогресс ==========
@@ -486,16 +718,18 @@ def watermark_sync(src):
 
 
 # ========== yt-dlp ==========
-def base_opts(url):
+def base_opts(url, proxy=...):
     p = platform_from_url(url)
+    if proxy is ...:
+        proxy = PROXY_URL
     o = {
         "noplaylist": True,
         "quiet": True,
         "no_warnings": True,
-        "retries": 5,
-        "socket_timeout": 60,
-        "extractor_retries": 5,
-        "file_access_retries": 5,
+        "retries": 2,
+        "socket_timeout": 25,
+        "extractor_retries": 2,
+        "file_access_retries": 2,
         "remote_components": ["ejs:github"],
         "extractor_args": {
             "youtube": {
@@ -505,17 +739,20 @@ def base_opts(url):
     }
     if COOKIES_FILE and COOKIES_FILE.exists():
         o["cookiefile"] = str(COOKIES_FILE)
-    if PROXY_URL and p == "youtube":
-        o["proxy"] = PROXY_URL
+    if proxy and p == "youtube":
+        o["proxy"] = proxy
     return o
 
 
-def ydl_options(url, kind, tpl, hook=None):
+def ydl_options(url, kind, tpl, hook=None, proxy=...):
     p = platform_from_url(url)
-    o = base_opts(url)
+    if proxy is ...:
+        proxy = PROXY_URL
+    o = base_opts(url, proxy)
     o["outtmpl"] = tpl
     if hook:
         o["progress_hooks"] = [hook]
+
     if kind == "audio":
         o["format"] = "bestaudio/best"
         o["postprocessors"] = [{
@@ -523,41 +760,42 @@ def ydl_options(url, kind, tpl, hook=None):
             "preferredcodec": "mp3",
             "preferredquality": "192",
         }]
-    elif p == "youtube":
-        o["format"] = YT_FORMATS.get(kind, YT_FORMATS["best"])
-        o["merge_output_format"] = "mp4"
     else:
-        o["format"] = SOCIAL_FORMATS.get(kind, SOCIAL_FORMATS["best"])
-        o["format_sort"] = ["res", "br"]
+        o["format"] = format_selector(kind, p)
+        if p != "youtube":
+            o["format_sort"] = ["res", "br"]
         o["merge_output_format"] = "mp4"
     return o
 
 
-def extract_info_sync(url):
-    o = base_opts(url)
+def extract_info_sync(url, proxy=...):
+    o = base_opts(url, proxy)
     o["skip_download"] = True
     with yt_dlp.YoutubeDL(o) as y:
         return y.extract_info(url, download=False)
 
 
-def search_sync(query, n=5):
+def search_sync(query, n=5, proxy=...):
     o = {
         "quiet": True, "no_warnings": True, "skip_download": True,
         "extract_flat": True, "noplaylist": True,
+        "socket_timeout": 30, "retries": 2,
     }
     if COOKIES_FILE and COOKIES_FILE.exists():
         o["cookiefile"] = str(COOKIES_FILE)
+    if proxy and proxy is not ...:
+        o["proxy"] = proxy
     with yt_dlp.YoutubeDL(o) as y:
         info = y.extract_info(f"ytsearch{n}:{query}", download=False)
     return [e for e in (info.get("entries") or []) if e]
 
 
-def download_sync(url, kind, hook=None):
+def download_sync(url, kind, hook=None, proxy=...):
     p = platform_from_url(url)
     job = DOWNLOAD_DIR / uuid.uuid4().hex
     job.mkdir(parents=True, exist_ok=True)
     tpl = str(job / "%(title).90B [%(id)s].%(ext)s")
-    with yt_dlp.YoutubeDL(ydl_options(url, kind, tpl, hook)) as y:
+    with yt_dlp.YoutubeDL(ydl_options(url, kind, tpl, hook, proxy)) as y:
         info = y.extract_info(url, download=True)
         expected = Path(y.prepare_filename(info))
     if kind == "audio":
@@ -576,10 +814,36 @@ def download_sync(url, kind, hook=None):
     return res
 
 
-def download_subs_sync(url):
+async def download_with_proxies(url, kind, hook):
+    platform = platform_from_url(url)
+    last_err = None
+    for proxy in proxy_candidates(platform):
+        try:
+            path = await asyncio.wait_for(
+                run_io(download_sync, url, kind, hook, proxy),
+                timeout=DOWNLOAD_TIMEOUT)
+            _proxy_success(proxy)
+            return path
+        except yt_dlp.utils.DownloadError as e:
+            if proxy and is_proxy_error(e):
+                _proxy_fail(proxy)
+                last_err = e
+                log.warning("прокси %s не сработал, пробую следующий", _mask(proxy))
+                continue
+            raise
+        except asyncio.TimeoutError:
+            if proxy:
+                _proxy_fail(proxy)
+            raise
+    if last_err:
+        raise last_err
+    raise yt_dlp.utils.DownloadError("нет доступных прокси")
+
+
+def download_subs_sync(url, proxy=...):
     job = DOWNLOAD_DIR / ("subs_" + uuid.uuid4().hex)
     job.mkdir(parents=True, exist_ok=True)
-    o = base_opts(url)
+    o = base_opts(url, proxy)
     o.update({
         "skip_download": True,
         "writesubtitles": True,
@@ -688,6 +952,33 @@ async def release_slot(ok):
 
 
 # ========== Команды ==========
+def check_proxy_sync():
+    pool = ([PROXY_URL] if PROXY_URL else []) + PROXY_LIST
+    lines = [f"PROXY_URL = {_mask(PROXY_URL) or '(пусто)'}"]
+    if not pool:
+        return "\n".join(lines) + "\n\n⚠️ прокси не задан"
+    for p in pool:
+        t0 = time.time()
+        try:
+            op = urllib.request.build_opener(
+                urllib.request.ProxyHandler({"http": p, "https": p}))
+            req = urllib.request.Request("https://www.youtube.com/",
+                                         headers={"User-Agent": "Mozilla/5.0"})
+            with op.open(req, timeout=15) as r:
+                lines.append(f"✅ {_mask(p)} → {r.status} за {time.time()-t0:.1f}с")
+        except Exception as e:
+            lines.append(f"❌ {_mask(p)} → {type(e).__name__}: {e}")
+    return "\n".join(lines)
+
+
+async def cmd_checkproxy(update, ctx):
+    if not ADMIN_ID or update.effective_user.id != ADMIN_ID:
+        return
+    msg = await update.message.reply_text("🌍 Проверяю прокси…")
+    out = await run_io(check_proxy_sync)
+    await msg.edit_text(out[:4000])
+
+
 async def cmd_start(update, ctx):
     args = ctx.args or []
     payload = args[0] if args else ""
@@ -704,7 +995,7 @@ async def cmd_start(update, ctx):
                 od["invited"] = od.get("invited", 0) + 1
                 if od["invited"] % REF_GOAL == 0:
                     od["bonus"] = od.get("bonus", 0) + 1
-        save_refs()
+        await asyncio.to_thread(save_refs)
 
     if not await require_subscription(update, ctx):
         return
@@ -742,7 +1033,7 @@ async def cmd_help(update, ctx):
         "• soundcloud.com\n\n"
         "⭐ Закладки — команда /saved\n"
         "🔍 Поиск — кнопка «🔍 Поиск» → название\n"
-        "✂️ Обрезка — после ссылки «Обрезать» → 00:10-00:40\n"
+        "✂️ Обрезка — после ссылки «Обрезка» → 00:10-00:40\n"
         "📝 Субтитры — кнопка после ссылки\n"
         "❌ Отмена — кнопка внизу или /cancel\n"
         "💬 Inline — @бот + ссылка в любом чате",
@@ -756,7 +1047,7 @@ async def cmd_status(update, ctx):
         a, w, c = active_jobs, waiting_jobs, completed_jobs
     inv, bonus = ref_stats(update.effective_user.id)
     cookies_note = "✅ загружены" if COOKIES_FILE and COOKIES_FILE.exists() else "❌ нет"
-    proxy_note = "✅ вкл" if PROXY_URL else "❌ выкл"
+    proxy_note = _mask(PROXY_URL) or "❌ выкл"
     await update.message.reply_text(
         f"📊 Статус\n"
         f"Активных: {a}/{MAX_CONCURRENT}\n"
@@ -818,10 +1109,10 @@ async def cmd_admin(update, ctx):
     errors = _stats["errors"]
     tops = sorted(_stats["platforms"].items(), key=lambda x: -x[1])[:5]
     top_str = "\n".join(f"• {PLATFORM_NAMES.get(k, k)} — {v}" for k, v in tops) or "—"
+    base = now.replace(hour=0, minute=0, second=0, microsecond=0)
     last7 = []
     for i in range(7):
-        d = (now.replace(hour=0, minute=0, second=0, microsecond=0)
-             .fromtimestamp(now.timestamp() - i * 86400, tz=timezone.utc))
+        d = base - timedelta(days=i)
         ds = d.strftime("%Y-%m-%d")
         last7.append(f"{ds}: {_stats['downloads'].get(ds, 0)}")
     await update.message.reply_text(
@@ -838,45 +1129,64 @@ async def cmd_admin(update, ctx):
 # ========== Превью + меню ==========
 async def show_video_menu(update, ctx, platform, url):
     msg = await update.effective_message.reply_text("🔍 Получаю информацию…")
-    loop = asyncio.get_running_loop()
+
     info = None
-    try:
-        info = await asyncio.wait_for(
-            loop.run_in_executor(None, extract_info_sync, url), timeout=60)
-    except asyncio.TimeoutError:
-        log.warning("info timeout")
-    except Exception:
-        log.warning("info failed", exc_info=True)
+    for proxy in proxy_candidates(platform):
+        try:
+            info = await asyncio.wait_for(
+                run_ytdlp(extract_info_sync, url, proxy), timeout=60)
+            _proxy_success(proxy)
+            break
+        except yt_dlp.utils.DownloadError as e:
+            if proxy and is_proxy_error(e):
+                _proxy_fail(proxy)
+                continue
+            log.warning("info failed", exc_info=True)
+            break
+        except asyncio.TimeoutError:
+            log.warning("info timeout")
+            break
+        except Exception:
+            log.warning("info failed", exc_info=True)
+            break
+
+    ctx.user_data["selected"] = set()
 
     if info:
-        title = truncate(info.get("title") or "Видео", 60)
-        lines = [f"{PLATFORM_NAMES[platform]}: {title}"]
-        up = truncate(info.get("uploader") or info.get("channel") or "", 40)
-        dur = fmt_dur(info.get("duration"))
-        if up:
-            lines.append(f"👤 {up}")
-        if dur:
-            lines.append(f"⏱ {dur}")
+        ctx.user_data["title"] = truncate(info.get("title") or "Видео", 80)
+        ctx.user_data["thumb_url"] = info.get("thumbnail")
+        ctx.user_data["ch_url"] = info.get("channel_url") or info.get("uploader_url") or ""
+        ctx.user_data["ch_name"] = info.get("uploader") or info.get("channel") or "канал"
+        caption, fmts = build_preview_text(info)
+        ctx.user_data["fmts"] = fmts
     else:
-        title = None
-        lines = [f"{PLATFORM_NAMES[platform]}: видео"]
+        ctx.user_data["title"] = None
+        ctx.user_data["thumb_url"] = None
+        ctx.user_data["ch_url"] = ""
+        ctx.user_data["ch_name"] = "канал"
+        ctx.user_data["fmts"] = {}
+        caption = f"{PLATFORM_NAMES[platform]}: видео\n\nФорматы для скачивания ↓"
 
-    lines += ["", "Выберите качество:"]
-    caption = "\n".join(lines)
-    ctx.user_data["title"] = title
+    ctx.user_data["heights"] = sorted(ctx.user_data["fmts"].keys())
+    kb = build_quality_kb(ctx.user_data["fmts"], set(),
+                          ctx.user_data["ch_url"], ctx.user_data["ch_name"])
 
     await msg.delete()
+
     thumb = info.get("thumbnail") if info else None
     if thumb:
-        data = await loop.run_in_executor(None, fetch_thumb_bytes, thumb, platform)
+        data = await run_io(fetch_thumb_bytes, thumb, platform)
         if data:
             try:
                 await update.effective_message.reply_photo(
-                    photo=data, caption=caption, reply_markup=QUALITY_MENU)
+                    photo=data, caption=caption,
+                    parse_mode="HTML", reply_markup=kb)
                 return
             except Exception:
-                log.warning("photo failed")
-    await update.effective_message.reply_text(caption, reply_markup=QUALITY_MENU)
+                log.warning("photo failed", exc_info=True)
+
+    await update.effective_message.reply_text(
+        caption, parse_mode="HTML", reply_markup=kb)
 
 
 # ========== Обработка текста ==========
@@ -936,10 +1246,9 @@ async def handle_text(update, ctx):
             await update.message.reply_text("Слишком длинный текст для QR.", reply_markup=REPLY_MENU)
             return
         msg = await update.message.reply_text("🔳 Создаю QR-код…")
-        loop = asyncio.get_running_loop()
         p = None
         try:
-            p = await loop.run_in_executor(None, make_qr_sync, text)
+            p = await run_io(make_qr_sync, text)
             with p.open("rb") as f:
                 await update.message.reply_photo(photo=f, caption=f"🔳 QR-код: {truncate(text, 60)}")
             await msg.delete()
@@ -958,10 +1267,9 @@ async def handle_text(update, ctx):
             await update.message.reply_text("Слишком длинный текст (макс. 800).", reply_markup=REPLY_MENU)
             return
         msg = await update.message.reply_text("🎙 Озвучиваю…")
-        loop = asyncio.get_running_loop()
         p = None
         try:
-            p = await loop.run_in_executor(None, tts_sync, text)
+            p = await run_io(tts_sync, text)
             with p.open("rb") as f:
                 await ctx.bot.send_voice(chat_id=update.effective_chat.id, voice=f, caption="🎙 Готово!")
             await msg.delete()
@@ -1045,10 +1353,9 @@ async def on_document(update, ctx):
 
     ctx.user_data.pop("await", None)
     await msg.edit_text("💧 Накладываю водяной знак…")
-    loop = asyncio.get_running_loop()
     out = None
     try:
-        out = await loop.run_in_executor(None, watermark_sync, src)
+        out = await run_io(watermark_sync, src)
         if out.stat().st_size / (1024 * 1024) > MAX_SIZE_MB:
             await ctx.bot.send_message(
                 update.effective_chat.id,
@@ -1074,10 +1381,8 @@ async def do_search(update, ctx, query):
         await update.effective_message.reply_text("Слишком короткий запрос.", reply_markup=REPLY_MENU)
         return
     msg = await update.effective_message.reply_text("🔍 Ищу на YouTube…")
-    loop = asyncio.get_running_loop()
     try:
-        results = await asyncio.wait_for(
-            loop.run_in_executor(None, search_sync, query, 5), timeout=40)
+        results = await asyncio.wait_for(run_ytdlp(search_sync, query, 5), timeout=60)
     except Exception:
         log.warning("search failed", exc_info=True)
         await msg.edit_text("Не удалось выполнить поиск.")
@@ -1104,60 +1409,64 @@ async def do_search(update, ctx, query):
 
 
 # ========== Скачивание ==========
-async def download_and_send(update, ctx, url, requested_kind, via_callback=False, trim=None):
+async def download_and_send(update, ctx, url, requested_kind,
+                            via_callback=False, trim=None, notify=True):
     query = update.callback_query if via_callback else None
     message = query.message if query else update.effective_message
     chat_id = message.chat_id
     user_id = update.effective_user.id
     platform = platform_from_url(url)
 
-    if platform == "youtube":
-        attempts = [requested_kind] + YT_FALLBACKS.get(requested_kind, [])
-    elif requested_kind == "audio":
-        attempts = ["audio"]
-    else:
-        attempts = (SOCIAL_ORDER[SOCIAL_ORDER.index(requested_kind):]
-                    if requested_kind in SOCIAL_ORDER else list(SOCIAL_ORDER))
+    heights = ctx.user_data.get("heights") or []
+    attempts = fallback_chain(requested_kind, platform, heights)
 
     await acquire_slot()
     ok = False
     loop = asyncio.get_running_loop()
     cookies_alerted = False
 
+    async def edit_card(_m, text):
+        try:
+            await ctx.bot.edit_message_caption(
+                chat_id=_m.chat_id, message_id=_m.message_id, caption=text)
+        except Exception:
+            try:
+                await ctx.bot.edit_message_text(
+                    chat_id=_m.chat_id, message_id=_m.message_id, text=text)
+            except Exception:
+                pass
+
     try:
         for idx, kind in enumerate(attempts):
-            label = LABELS.get(kind, kind)
+            label = label_for(kind)
             head = f"🎬 {label}\n\n📥 Готовлю загрузку…"
             if idx:
                 head = f"🎬 {label}\n\n⏳ Пробую снова…"
 
             if via_callback:
+                pmsg = query.message
+                await edit_card(pmsg, head)
                 try:
-                    await query.edit_message_text(head)
-                    pmsg = query.message
+                    await ctx.bot.edit_message_reply_markup(
+                        chat_id=pmsg.chat_id, message_id=pmsg.message_id, reply_markup=None)
                 except Exception:
-                    pmsg = await ctx.bot.send_message(chat_id, head)
+                    pass
             else:
                 pmsg = await message.reply_text(head)
 
             async def upd(t, _m=pmsg):
-                try:
-                    await ctx.bot.edit_message_text(
-                        chat_id=_m.chat_id, message_id=_m.message_id, text=t)
-                except Exception:
-                    pass
+                await edit_card(_m, t)
 
             hook = ProgressHook(loop, upd, label)
             await ctx.bot.send_chat_action(chat_id, ChatAction.UPLOAD_VIDEO)
             path = None
 
             try:
-                path = await loop.run_in_executor(None, download_sync, url, kind, hook)
+                path = await download_with_proxies(url, kind, hook)
 
                 if trim:
                     try:
-                        trimmed = await loop.run_in_executor(
-                            None, trim_sync, path, trim[0], trim[1])
+                        trimmed = await run_io(trim_sync, path, trim[0], trim[1])
                         cleanup_file(path)
                         path = trimmed
                     except Exception:
@@ -1170,12 +1479,9 @@ async def download_and_send(update, ctx, url, requested_kind, via_callback=False
                     path = None
                     continue
 
-                try:
-                    await ctx.bot.edit_message_text(
-                        chat_id=pmsg.chat_id, message_id=pmsg.message_id,
-                        text=f"🎬 {label} 💾 {human_size(path.stat().st_size)}\n\n📤 Загружаю…")
-                except Exception:
-                    pass
+                await edit_card(
+                    pmsg,
+                    f"🎬 {label} 💾 {human_size(path.stat().st_size)}\n\n📤 Загружаю…")
 
                 with path.open("rb") as fh:
                     if kind == "audio":
@@ -1190,24 +1496,38 @@ async def download_and_send(update, ctx, url, requested_kind, via_callback=False
                 stat_download(platform)
                 await add_bookmark(user_id, url, ctx.user_data.get("title"), platform)
 
-                try:
-                    await ctx.bot.delete_message(pmsg.chat_id, pmsg.message_id)
-                except Exception:
-                    pass
-
-                await ctx.bot.send_message(
-                    chat_id,
-                    "✅ Готово! Сохранил в ⭐ Закладки (команда /saved)",
-                    reply_markup=share_keyboard(url, platform, ctx.bot.username or "bot"))
+                if notify:
+                    try:
+                        await ctx.bot.delete_message(pmsg.chat_id, pmsg.message_id)
+                    except Exception:
+                        pass
+                    await ctx.bot.send_message(
+                        chat_id,
+                        "✅ Готово! Сохранил в ⭐ Закладки (команда /saved)",
+                        reply_markup=share_keyboard(url, platform, ctx.bot.username or "bot"))
+                else:
+                    await edit_card(pmsg, f"✅ {label} — готово")
                 return
 
             except yt_dlp.utils.DownloadError as e:
                 err = str(e)
                 log.warning("format %s: %s", kind, clean_err(e))
                 _stats["errors"] = _stats.get("errors", 0) + 1
+                if is_proxy_error(e):
+                    log.warning("abort fallback: proxy dead")
+                    raise
                 if not cookies_alerted and ("Sign in to confirm" in err or "cookies" in err.lower()):
                     cookies_alerted = True
                     await notify_admin(ctx, "Cookies YouTube устарели — обновите Secret Files.")
+                try:
+                    await ctx.bot.delete_message(pmsg.chat_id, pmsg.message_id)
+                except Exception:
+                    pass
+                if idx == len(attempts) - 1:
+                    raise
+            except asyncio.TimeoutError:
+                log.warning("download timeout for %s", kind)
+                _stats["errors"] = _stats.get("errors", 0) + 1
                 try:
                     await ctx.bot.delete_message(pmsg.chat_id, pmsg.message_id)
                 except Exception:
@@ -1222,7 +1542,18 @@ async def download_and_send(update, ctx, url, requested_kind, via_callback=False
     except yt_dlp.utils.DownloadError as e:
         log.warning("download failed: %s", clean_err(e))
         _stats["errors"] = _stats.get("errors", 0) + 1
-        await ctx.bot.send_message(chat_id, unavailable_message(), reply_markup=REPLY_MENU)
+        if is_proxy_error(e):
+            await ctx.bot.send_message(
+                chat_id,
+                f"🌍 Прокси недоступен. Попробуй позже или напиши {CONTACT_TEXT}.",
+                reply_markup=REPLY_MENU)
+            await notify_admin(ctx, "Прокси мёртв — проверь PROXY_URL/PROXY_LIST.")
+        else:
+            await ctx.bot.send_message(chat_id, unavailable_message(), reply_markup=REPLY_MENU)
+    except asyncio.TimeoutError:
+        _stats["errors"] = _stats.get("errors", 0) + 1
+        await ctx.bot.send_message(chat_id, "⏱ Загрузка заняла слишком много времени. Попробуй ещё раз.",
+                                   reply_markup=REPLY_MENU)
     except Exception:
         log.exception("download error")
         _stats["errors"] = _stats.get("errors", 0) + 1
@@ -1238,11 +1569,9 @@ async def send_subs(update, ctx, url):
         await q.edit_message_text("📝 Ищу субтитры…")
     except Exception:
         pass
-    loop = asyncio.get_running_loop()
     path = None
     try:
-        path = await asyncio.wait_for(
-            loop.run_in_executor(None, download_subs_sync, url), timeout=90)
+        path = await asyncio.wait_for(run_ytdlp(download_subs_sync, url), timeout=120)
         with path.open("rb") as f:
             await ctx.bot.send_document(chat_id=q.message.chat_id, document=f,
                                         filename=path.name, caption="📝 Субтитры")
@@ -1261,26 +1590,63 @@ async def send_subs(update, ctx, url):
         cleanup_file(path)
 
 
+# ========== Превью ==========
+async def send_preview_image(update, ctx):
+    q = update.callback_query
+    thumb = ctx.user_data.get("thumb_url")
+    platform = ctx.user_data.get("platform", "other")
+    title = truncate(ctx.user_data.get("title") or "Превью", 100)
+
+    if not thumb:
+        await ctx.bot.send_message(q.message.chat_id, "🖼 Превью недоступно.")
+        return
+
+    data = await run_io(fetch_thumb_bytes, thumb, platform)
+    if not data:
+        await ctx.bot.send_message(q.message.chat_id, "❌ Не удалось получить превью.")
+        return
+
+    try:
+        await ctx.bot.send_photo(chat_id=q.message.chat_id, photo=data,
+                                 caption=f"🖼 {title}")
+    except Exception:
+        await ctx.bot.send_document(chat_id=q.message.chat_id,
+                                    document=io.BytesIO(data),
+                                    filename="preview.jpg",
+                                    caption=f"🖼 {title}")
+
+
 # ========== Кнопки ==========
 async def on_callback(update, ctx):
     q = update.callback_query
     data = q.data or ""
 
+    answered = False
+
+    async def answer(*a, **kw):
+        nonlocal answered
+        if answered:
+            return
+        answered = True
+        try:
+            await q.answer(*a, **kw)
+        except Exception:
+            pass
+
     if data == "sub:check":
-        if await check_subscription(ctx.bot, q.from_user.id):
-            await q.answer("Подписка подтверждена")
+        if await check_subscription(ctx.bot, q.from_user.id, force=True):
+            await answer("Подписка подтверждена")
             await q.message.reply_text("Спасибо! Теперь отправь ссылку.", reply_markup=REPLY_MENU)
         else:
-            await q.answer("Сначала подпишись на канал.", show_alert=True)
+            await answer("Сначала подпишись на канал.", show_alert=True)
         return
 
     if data == "share:more":
-        await q.answer("Пришли новую ссылку!")
+        await answer("Пришли новую ссылку!")
         return
 
-    await q.answer()
-
     if data.startswith("bk:"):
+        await answer()
         val = data[3:]
         if val == "close":
             try:
@@ -1296,21 +1662,17 @@ async def on_callback(update, ctx):
                 pass
             return
         b = items[int(val)]
-        ctx.user_data.clear()
-        ctx.user_data["url"] = b["url"]
-        ctx.user_data["platform"] = b.get("platform", "other")
         try:
             await q.message.delete()
         except Exception:
             pass
-        chat_id = q.message.chat_id
-        await ctx.bot.send_message(
-            chat_id,
-            f"⭐ Повтор закладки:\n{b.get('title') or b['url']}\n\nВыберите качество:",
-            reply_markup=QUALITY_MENU)
+        last = update
+        last.callback_query = None
+        await show_video_menu(update, ctx, b.get("platform", "other"), b["url"])
         return
 
     if data.startswith("tool:"):
+        await answer()
         tool = data[5:]
         if tool == "qr":
             ctx.user_data["await"] = "qr"
@@ -1335,6 +1697,7 @@ async def on_callback(update, ctx):
         return
 
     if data.startswith("conv:"):
+        await answer()
         target = data[5:]
         if target == "cancel":
             ctx.user_data.pop("conv_src", None)
@@ -1354,12 +1717,10 @@ async def on_callback(update, ctx):
             await q.edit_message_text(f"🔄 Конвертирую в {target.upper()}…")
         except Exception:
             pass
-        loop = asyncio.get_running_loop()
         out = None
         try:
             out = await asyncio.wait_for(
-                loop.run_in_executor(None, convert_sync, Path(src_path), target),
-                timeout=900)
+                run_io(convert_sync, Path(src_path), target), timeout=900)
             size_mb = out.stat().st_size / (1024 * 1024)
             if size_mb > MAX_SIZE_MB:
                 await ctx.bot.send_message(
@@ -1388,6 +1749,7 @@ async def on_callback(update, ctx):
         return
 
     if data.startswith("s:"):
+        await answer()
         val = data[2:]
         if val == "cancel":
             try:
@@ -1405,9 +1767,90 @@ async def on_callback(update, ctx):
         await download_and_send(update, ctx, results[int(val)], "best", via_callback=True)
         return
 
+    # ===== новое меню форматов =====
+    if data.startswith("fmt:"):
+        act = data[4:]
+
+        if not await check_subscription(ctx.bot, q.from_user.id):
+            await answer("Сначала подпишись на канал.", show_alert=True)
+            await q.message.reply_text(f"Подпишись на {CHANNEL}.", reply_markup=sub_keyboard())
+            return
+
+        fmts = ctx.user_data.get("fmts") or {}
+        sel = ctx.user_data.setdefault("selected", set())
+
+        if act.startswith("t:"):
+            try:
+                h = int(act[2:])
+            except ValueError:
+                await answer()
+                return
+            if h in sel:
+                sel.discard(h)
+            else:
+                sel.add(h)
+            try:
+                await q.edit_message_reply_markup(reply_markup=build_quality_kb(
+                    fmts, sel,
+                    ctx.user_data.get("ch_url", ""),
+                    ctx.user_data.get("ch_name", "")))
+            except Exception:
+                pass
+            await answer()
+            return
+
+        url = ctx.user_data.get("url")
+        if not url:
+            await answer("Ссылка устарела.", show_alert=True)
+            return
+
+        if act == "prev":
+            await answer()
+            await send_preview_image(update, ctx)
+            return
+
+        if act == "trim":
+            await answer()
+            ctx.user_data["await"] = "trim"
+            ctx.user_data["trim_url"] = url
+            await ctx.bot.send_message(
+                q.message.chat_id, "✂️ Пришли диапазон, например: 00:10-00:40",
+                reply_markup=REPLY_MENU)
+            return
+
+        if act == "audio":
+            await answer()
+            await download_and_send(update, ctx, url, "audio", via_callback=True)
+            return
+
+        if act == "best":
+            await answer()
+            best = str(max(fmts)) if fmts else "best"
+            await download_and_send(update, ctx, url, best, via_callback=True)
+            return
+
+        if act == "dl":
+            if not sel:
+                await answer("Ничего не выбрано.", show_alert=True)
+                return
+            await answer()
+            items = sorted(sel)
+            total = len(items)
+            for i, h in enumerate(items):
+                await download_and_send(update, ctx, url, str(h),
+                                        via_callback=True,
+                                        notify=(i == total - 1))
+            sel.clear()
+            return
+
+        await answer()
+        return
+
+    # ===== старое меню q: (совместимость) =====
     action = data.removeprefix("q:")
 
     if action == "cancel":
+        await answer()
         ctx.user_data.clear()
         try:
             await q.edit_message_reply_markup(reply_markup=None)
@@ -1419,12 +1862,14 @@ async def on_callback(update, ctx):
             pass
         return
 
-    if not await check_subscription(ctx.bot, q.from_user.id):
+    if not await check_subscription(ctx.bot, q.from_user.id, force=(action == "bk")):
+        await answer("Сначала подпишись на канал.", show_alert=True)
         await q.message.reply_text(f"Подпишись на {CHANNEL}.", reply_markup=sub_keyboard())
         return
 
     url = ctx.user_data.get("url")
     if not url:
+        await answer()
         try:
             await q.edit_message_text("Ссылка устарела.")
         except Exception:
@@ -1432,16 +1877,18 @@ async def on_callback(update, ctx):
         return
 
     if action == "subs":
+        await answer()
         await send_subs(update, ctx, url)
         return
 
     if action == "bk":
+        await answer("⭐ Добавлено в закладки!", show_alert=True)
         await add_bookmark(q.from_user.id, url, ctx.user_data.get("title"),
                            ctx.user_data.get("platform", "other"))
-        await q.answer("⭐ Добавлено в закладки!", show_alert=True)
         return
 
     if action == "trim":
+        await answer()
         ctx.user_data["await"] = "trim"
         ctx.user_data["trim_url"] = url
         try:
@@ -1450,6 +1897,7 @@ async def on_callback(update, ctx):
             pass
         return
 
+    await answer()
     await download_and_send(update, ctx, url, action, via_callback=True)
 
 
@@ -1509,7 +1957,7 @@ async def digest_loop(app):
             now = datetime.now(timezone.utc)
             target = now.replace(hour=DIGEST_HOUR, minute=0, second=0, microsecond=0)
             if target <= now:
-                target = target.replace(day=target.day + 1)
+                target = target + timedelta(days=1)
             wait = (target - now).total_seconds()
             await asyncio.sleep(wait)
             if not ADMIN_ID:
@@ -1530,9 +1978,23 @@ async def digest_loop(app):
                 f"❌ Ошибок: {_stats['errors']}\n"
                 f"🏆 Топ: {top_str}\n"
                 f"⚙️ Сейчас: активно {a}, в очереди {w}")
+        except asyncio.CancelledError:
+            log.info("digest_loop stopped")
+            raise
         except Exception:
             log.warning("digest loop error", exc_info=True)
             await asyncio.sleep(3600)
+
+
+# ========== Фоновые задачи ==========
+_background_tasks = set()
+
+
+def spawn_task(coro):
+    t = asyncio.create_task(coro)
+    _background_tasks.add(t)
+    t.add_done_callback(_background_tasks.discard)
+    return t
 
 
 # ========== Запуск ==========
@@ -1545,24 +2007,35 @@ async def post_init(app: Application):
         BotCommand("status", "📊 Статус"),
         BotCommand("cancel", "❌ Отмена"),
     ])
-    asyncio.create_task(digest_loop(app))
+    spawn_task(digest_loop(app))
 
 
-def main():
-    if not TOKEN:
-        raise SystemExit("Не задана BOT_TOKEN.")
-    load_refs()
-    load_bookmarks()
-    if os.getenv("PORT"):
-        Thread(target=start_health_server, daemon=True).start()
+async def post_shutdown(app: Application):
+    for t in list(_background_tasks):
+        t.cancel()
+    if _background_tasks:
+        await asyncio.gather(*_background_tasks, return_exceptions=True)
+    _background_tasks.clear()
+    log.info("shutdown complete")
 
-    app = (Application.builder()
-           .token(TOKEN)
-           .post_init(post_init)
-           .connect_timeout(30).read_timeout(30).write_timeout(30).pool_timeout(30)
-           .get_updates_connect_timeout(30).get_updates_read_timeout(30)
-           .build())
 
+async def on_error(update, ctx):
+    err = ctx.error
+    # Conflict при polling — не ошибка, просто пережидаем
+    if err.__class__.__name__ == "Conflict":
+        log.warning("Conflict с getUpdates — другой инстанс ещё жив")
+        return
+    log.exception("handler error", exc_info=err)
+    try:
+        if isinstance(update, Update) and update.effective_message:
+            await update.effective_message.reply_text(
+                "⚠️ Внутренняя ошибка. Попробуйте ещё раз.",
+                reply_markup=REPLY_MENU)
+    except Exception:
+        pass
+
+
+def register_handlers(app):
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("help", cmd_help))
     app.add_handler(CommandHandler("status", cmd_status))
@@ -1570,13 +2043,66 @@ def main():
     app.add_handler(CommandHandler("ref", cmd_ref))
     app.add_handler(CommandHandler("saved", cmd_saved))
     app.add_handler(CommandHandler("admin", cmd_admin))
+    app.add_handler(CommandHandler("checkproxy", cmd_checkproxy))
     app.add_handler(InlineQueryHandler(on_inline))
-    app.add_handler(CallbackQueryHandler(on_callback, pattern=r"^(q:|sub:|s:|tool:|conv:|bk:|share:)"))
+    app.add_handler(CallbackQueryHandler(
+        on_callback, pattern=r"^(q:|fmt:|sub:|s:|tool:|conv:|bk:|share:)"))
     app.add_handler(MessageHandler(filters.Document.ALL, on_document))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
+    app.add_error_handler(on_error)
 
-    log.info("Бот запускается. Прокси: %s", bool(PROXY_URL))
-    app.run_polling(allowed_updates=Update.ALL_TYPES)
+
+def main():
+    if not TOKEN:
+        raise SystemExit("Не задана BOT_TOKEN.")
+    load_refs()
+    load_bookmarks()
+
+    app = (Application.builder()
+           .token(TOKEN)
+           .post_init(post_init)
+           .post_shutdown(post_shutdown)
+           .connect_timeout(30).read_timeout(30).write_timeout(30).pool_timeout(30)
+           .get_updates_connect_timeout(30).get_updates_read_timeout(30)
+           .build())
+
+    register_handlers(app)
+
+    log.info("Бот запускается. Режим: %s | Прокси: %s", RUN_MODE, _mask(PROXY_URL))
+
+    if RUN_MODE == "webhook":
+        base_url = (os.getenv("RENDER_EXTERNAL_URL")
+                    or os.getenv("WEBHOOK_URL", "")).rstrip("/")
+        if not base_url:
+            raise SystemExit("Для webhook нужен RENDER_EXTERNAL_URL или WEBHOOK_URL.")
+        app.run_webhook(
+            listen="0.0.0.0",
+            port=int(os.getenv("PORT", "8000")),
+            url_path=WEBHOOK_PATH,
+            webhook_url=f"{base_url}{WEBHOOK_PATH}",
+            allowed_updates=Update.ALL_TYPES,
+            drop_pending_updates=DROP_PENDING,
+        )
+        return
+
+    # polling
+    if os.getenv("PORT"):
+        Thread(target=start_health_server, daemon=True).start()
+
+    while True:
+        try:
+            app.run_polling(
+                allowed_updates=Update.ALL_TYPES,
+                drop_pending_updates=DROP_PENDING,
+            )
+        except Exception as e:
+            if e.__class__.__name__ == "Conflict":
+                log.warning("Conflict при старте, повтор через 15 сек")
+                time.sleep(15)
+                continue
+            raise
+        else:
+            break
 
 
 if __name__ == "__main__":
