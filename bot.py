@@ -737,12 +737,11 @@ def base_opts(url, proxy=...):
         "extractor_retries": 2,
         "file_access_retries": 2,
         "remote_components": ["ejs:github"],
-        "extractor_args": {
-            "youtube": {
-                "player_client": ["web_embedded", "tv_embedded", "default"],
-            },
-        },
-    }
+       "extractor_args": {
+    "youtube": {
+        "player_client": ["default"],
+    },
+},
     if COOKIES_FILE and COOKIES_FILE.exists():
         o["cookiefile"] = str(COOKIES_FILE)
     if proxy and p == "youtube":
