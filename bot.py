@@ -743,11 +743,6 @@ def base_opts(url, proxy=...):
             },
         },
     }
-    # TLS-отпечаток браузера через curl_cffi — YouTube пускает охотнее
-    if IMPERSONATE:
-        o["impersonate"] = IMPERSONATE
-        if p == "youtube":
-            o["extractor_args"]["youtube"]["player_skip"] = ["webpage"]
     if COOKIES_FILE and COOKIES_FILE.exists():
         o["cookiefile"] = str(COOKIES_FILE)
     if proxy and p == "youtube":
