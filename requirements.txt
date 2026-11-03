@@ -2,4 +2,7 @@ python-telegram-bot>=21.0
 yt-dlp
 curl_cffi
 qrcode[pil]
+Pillow
 gTTS
+pysocks
+httpx
