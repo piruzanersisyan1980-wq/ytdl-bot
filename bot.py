@@ -55,6 +55,11 @@ SUB_CACHE_TTL    = int(os.getenv("SUB_CACHE_TTL", "300"))
 DOWNLOAD_TIMEOUT = int(os.getenv("DOWNLOAD_TIMEOUT", "1800"))
 DROP_PENDING     = os.getenv("DROP_PENDING", "0") == "1"
 
+# TLS-отпечаток браузера (через curl_cffi). Пусто = выключено.
+IMPERSONATE = os.getenv("IMPERSONATE", "chrome").strip()
+if IMPERSONATE.lower() in ("0", "none", "off", "false", "no"):
+    IMPERSONATE = ""
+
 # прокси
 PROXY_URL             = os.getenv("PROXY_URL", "").strip()
 PROXY_LIST            = [p.strip() for p in os.getenv("PROXY_LIST", "").split(",") if p.strip()]
@@ -64,7 +69,7 @@ if not PROXY_URL and PROXY_LIST:
     PROXY_URL = PROXY_LIST[0]
 
 # запуск: polling | webhook
-RUN_MODE = os.getenv("RUN_MODE", "polling").lower()
+RUN_MODE     = os.getenv("RUN_MODE", "polling").lower()
 WEBHOOK_PATH = os.getenv("WEBHOOK_PATH", "/telegram")
 
 CHANNEL      = "@edrikevideo"
@@ -81,6 +86,7 @@ logging.basicConfig(
     format="%(asctime)s %(levelname)s %(name)s: %(message)s",
     level=logging.INFO,
 )
+logging.getLogger("httpx").setLevel(logging.WARNING)   # гасим шум httpx
 log = logging.getLogger("ytdl-bot")
 
 # ========== Пул потоков и семафоры ==========
@@ -102,6 +108,12 @@ async def run_ytdlp(fn, *args):
 _proxy_state = {}   # proxy -> (до_какого_времени_отложен, счётчик_ошибок)
 
 
+def _mask(p):
+    if not p:
+        return ""
+    return re.sub(r"://[^@/]+@", "://***:***@", p)
+
+
 def _proxy_ok(p):
     until, _ = _proxy_state.get(p, (0, 0))
     return time.time() >= until
@@ -118,12 +130,6 @@ def _proxy_fail(p):
 def _proxy_success(p):
     if p:
         _proxy_state.pop(p, None)
-
-
-def _mask(p):
-    if not p:
-        return ""
-    return re.sub(r"://[^@/]+@", "://***:***@", p)
 
 
 def is_proxy_error(e):
@@ -526,7 +532,7 @@ def build_preview_text(info):
     if uploader:
         up = html.escape(truncate(uploader, 40))
         if up_url:
-            lines.append(f'👤 <a href="{up_url}">{up}</a> ➔')
+            lines.append(f'👤 <a href="{html.escape(up_url, quote=True)}">{up}</a> ➔')
         else:
             lines.append(f"👤 {up} ➔")
 
@@ -740,7 +746,6 @@ def base_opts(url, proxy=...):
     # TLS-отпечаток браузера через curl_cffi — YouTube пускает охотнее
     if IMPERSONATE:
         o["impersonate"] = IMPERSONATE
-        # для скачивания по частям тоже используем тот же отпечаток
         if p == "youtube":
             o["extractor_args"]["youtube"]["player_skip"] = ["webpage"]
     if COOKIES_FILE and COOKIES_FILE.exists():
@@ -789,6 +794,8 @@ def search_sync(query, n=5, proxy=...):
     }
     if COOKIES_FILE and COOKIES_FILE.exists():
         o["cookiefile"] = str(COOKIES_FILE)
+    if IMPERSONATE:
+        o["impersonate"] = IMPERSONATE
     if proxy and proxy is not ...:
         o["proxy"] = proxy
     with yt_dlp.YoutubeDL(o) as y:
@@ -960,7 +967,8 @@ async def release_slot(ok):
 # ========== Команды ==========
 def check_proxy_sync():
     pool = ([PROXY_URL] if PROXY_URL else []) + PROXY_LIST
-    lines = [f"PROXY_URL = {_mask(PROXY_URL) or '(пусто)'}"]
+    lines = [f"PROXY_URL = {_mask(PROXY_URL) or '(пусто)'}",
+             f"IMPERSONATE = {IMPERSONATE or '(выкл)'}"]
     if not pool:
         return "\n".join(lines) + "\n\n⚠️ прокси не задан"
     for p in pool:
@@ -1061,6 +1069,7 @@ async def cmd_status(update, ctx):
         f"Скачано за сессию: {c}\n"
         f"🍪 Cookies: {cookies_note}\n"
         f"🌍 Прокси: {proxy_note}\n"
+        f"🎭 Impersonate: {IMPERSONATE or 'выкл'}\n"
         f"Приглашено: {inv} (бонусов: {bonus})\n"
         f"Аптайм: {fmt_uptime(int(time.time() - started_at))}",
         reply_markup=REPLY_MENU)
@@ -1672,8 +1681,6 @@ async def on_callback(update, ctx):
             await q.message.delete()
         except Exception:
             pass
-        last = update
-        last.callback_query = None
         await show_video_menu(update, ctx, b.get("platform", "other"), b["url"])
         return
 
@@ -1773,7 +1780,7 @@ async def on_callback(update, ctx):
         await download_and_send(update, ctx, results[int(val)], "best", via_callback=True)
         return
 
-    # ===== новое меню форматов =====
+    # ===== меню форматов =====
     if data.startswith("fmt:"):
         act = data[4:]
 
@@ -2027,7 +2034,6 @@ async def post_shutdown(app: Application):
 
 async def on_error(update, ctx):
     err = ctx.error
-    # Conflict при polling — не ошибка, просто пережидаем
     if err.__class__.__name__ == "Conflict":
         log.warning("Conflict с getUpdates — другой инстанс ещё жив")
         return
@@ -2074,7 +2080,8 @@ def main():
 
     register_handlers(app)
 
-    log.info("Бот запускается. Режим: %s | Прокси: %s", RUN_MODE, _mask(PROXY_URL))
+    log.info("Бот запускается. Режим: %s | Прокси: %s | Impersonate: %s",
+             RUN_MODE, _mask(PROXY_URL), IMPERSONATE or "выкл")
 
     if RUN_MODE == "webhook":
         base_url = (os.getenv("RENDER_EXTERNAL_URL")
